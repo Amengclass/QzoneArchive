@@ -198,16 +198,28 @@ jobs:
     needs: [windows, macos-x64, macos-arm64, android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+      actions: read
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 
+      - name: Show release files
+        shell: bash
+        run: find artifacts -type f -print
+
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_name }}
           files: artifacts/**/*
           draft: true
           generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
