@@ -1,0 +1,1567 @@
+use std::{
+    collections::HashSet,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use serde_json::Value;
+use tauri::Manager;
+
+use crate::{qlogin::QLoginState, qzone};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveProgress {
+    status: &'static str,
+    pages: u32,
+    fetched: u64,
+    saved: u64,
+    message: String,
+    retry_at: Option<i64>,
+}
+
+impl Default for ArchiveProgress {
+    fn default() -> Self {
+        Self {
+            status: "idle",
+            pages: 0,
+            fetched: 0,
+            saved: 0,
+            message: "尚未开始归档".into(),
+            retry_at: None,
+        }
+    }
+}
+
+pub struct ArchiveState {
+    progress: Mutex<ArchiveProgress>,
+    cancel: AtomicBool,
+}
+
+impl ArchiveState {
+    pub fn new() -> Self {
+        Self {
+            progress: Mutex::new(ArchiveProgress::default()),
+            cancel: AtomicBool::new(false),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveItem {
+    #[serde(skip)]
+    owner_uin: String,
+    id: i64,
+    cell_id: String,
+    published_at: i64,
+    content: Option<String>,
+    author_uin: Option<String>,
+    author_name: Option<String>,
+    picture_urls: Vec<String>,
+    video_url: Option<String>,
+    video_urls: Vec<String>,
+    video_cover_url: Option<String>,
+    like_count: i64,
+    comment_count: i64,
+    likes: Vec<LikeUser>,
+    comments: Vec<ArchiveComment>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveComment {
+    uin: Option<String>,
+    nickname: Option<String>,
+    content: String,
+    created_at: i64,
+    replies: Vec<ArchiveReply>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveReply {
+    uin: Option<String>,
+    nickname: Option<String>,
+    content: String,
+    created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LikeUser {
+    uin: Option<String>,
+    nickname: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveOverview {
+    dynamics: u64,
+    pictures: u64,
+    comments: u64,
+    likes: u64,
+    database_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InteractionRank {
+    uin: String,
+    nickname: String,
+    interactions: u64,
+    likes: u64,
+    comments: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveMediaItem {
+    key: String,
+    dynamic_id: i64,
+    media_type: &'static str,
+    url: String,
+    cover_url: Option<String>,
+    published_at: i64,
+    author_uin: Option<String>,
+    author_name: Option<String>,
+    content: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveMediaPage {
+    items: Vec<ArchiveMediaItem>,
+    total: usize,
+    years: Vec<i32>,
+}
+
+struct ParsedFeed {
+    feed_key: String,
+    cell_id: Option<String>,
+    event_type: i64,
+    event_time: i64,
+    title: Option<String>,
+    content: Option<String>,
+    event_summary: Option<String>,
+    actor_uin: Option<String>,
+    actor_name: Option<String>,
+    original_author_uin: Option<String>,
+    original_author_name: Option<String>,
+    picture_count: i64,
+    pictures_json: Option<String>,
+    video_json: Option<String>,
+    comments_json: Option<String>,
+    raw_json: String,
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
+    fs::create_dir_all(&dir).map_err(|error| format!("无法创建应用数据目录：{error}"))?;
+    Ok(dir.join("qzone-archive.sqlite3"))
+}
+
+fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
+    let mut connection = Connection::open(database_path(app)?)
+        .map_err(|error| format!("无法打开归档数据库：{error}"))?;
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+         PRAGMA foreign_keys=ON;
+         CREATE TABLE IF NOT EXISTS archive_feeds (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           feed_key TEXT NOT NULL,
+           cell_id TEXT,
+           event_type INTEGER NOT NULL DEFAULT 0,
+           event_time INTEGER NOT NULL DEFAULT 0,
+           title TEXT,
+           content TEXT,
+           event_summary TEXT,
+           actor_uin TEXT,
+           actor_name TEXT,
+           original_author_uin TEXT,
+           original_author_name TEXT,
+           picture_count INTEGER NOT NULL DEFAULT 0,
+           pictures_json TEXT,
+           video_json TEXT,
+           comments_json TEXT,
+           raw_json TEXT NOT NULL,
+           archived_at INTEGER NOT NULL,
+           UNIQUE(owner_uin, feed_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_feeds_owner_time
+           ON archive_feeds(owner_uin, event_time DESC);
+         CREATE INDEX IF NOT EXISTS idx_archive_feeds_dynamic_type
+           ON archive_feeds(owner_uin, cell_id, event_type);
+         CREATE TABLE IF NOT EXISTS archive_dynamics (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           cell_id TEXT NOT NULL,
+           published_at INTEGER NOT NULL DEFAULT 0,
+           content TEXT,
+           author_uin TEXT,
+           author_name TEXT,
+           category TEXT NOT NULL DEFAULT '',
+           pictures_json TEXT,
+           video_json TEXT,
+           raw_original_json TEXT NOT NULL,
+           archived_at INTEGER NOT NULL,
+           UNIQUE(owner_uin, cell_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_dynamics_owner_time
+           ON archive_dynamics(owner_uin, published_at DESC);
+         CREATE TABLE IF NOT EXISTS archive_checkpoints (
+           owner_uin TEXT PRIMARY KEY,
+           attach_info TEXT NOT NULL,
+           pages INTEGER NOT NULL DEFAULT 0,
+           fetched INTEGER NOT NULL DEFAULT 0,
+           saved INTEGER NOT NULL DEFAULT 0,
+           updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS archive_rate_limits (
+           owner_uin TEXT PRIMARY KEY,
+           window_started_at INTEGER NOT NULL,
+           requested_pages INTEGER NOT NULL DEFAULT 0
+         );",
+        )
+        .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
+    if connection
+        .prepare("SELECT pages,fetched,saved FROM archive_checkpoints LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute_batch(
+                "ALTER TABLE archive_checkpoints ADD COLUMN pages INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE archive_checkpoints ADD COLUMN fetched INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE archive_checkpoints ADD COLUMN saved INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| format!("升级归档续传统计失败：{error}"))?;
+    }
+    if connection
+        .prepare("SELECT category FROM archive_dynamics LIMIT 0")
+        .is_err()
+    {
+        connection
+            .execute(
+                "ALTER TABLE archive_dynamics ADD COLUMN category TEXT NOT NULL DEFAULT ''",
+                [],
+            )
+            .map_err(|error| format!("升级归档分类失败：{error}"))?;
+    }
+    migrate_legacy_dynamics(&mut connection)?;
+    migrate_dynamic_categories(&mut connection)?;
+    Ok(connection)
+}
+
+fn migrate_dynamic_categories(connection: &mut Connection) -> Result<(), String> {
+    let pending: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_dynamics WHERE category=''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("检查归档分类迁移状态失败：{error}"))?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let feeds = {
+        let mut statement = connection
+            .prepare("SELECT owner_uin,raw_json FROM archive_feeds")
+            .map_err(|error| format!("读取待分类归档失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("查询待分类归档失败：{error}"))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始归档分类迁移失败：{error}"))?;
+    for (owner_uin, raw_json) in feeds {
+        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
+            save_original_dynamic(&transaction, &owner_uin, &feed)?;
+        }
+    }
+    transaction.execute(
+        "UPDATE archive_dynamics SET category=CASE WHEN author_uin=owner_uin THEN 'self' ELSE 'other' END WHERE category=''",
+        [],
+    ).map_err(|error| format!("补全归档分类失败：{error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交归档分类迁移失败：{error}"))
+}
+
+fn migrate_legacy_dynamics(connection: &mut Connection) -> Result<(), String> {
+    let dynamic_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM archive_dynamics", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| format!("检查原动态迁移状态失败：{error}"))?;
+    if dynamic_count > 0 {
+        return Ok(());
+    }
+    let legacy = {
+        let mut statement = connection
+            .prepare("SELECT owner_uin,raw_json FROM archive_feeds")
+            .map_err(|error| format!("读取旧归档失败：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("查询旧归档失败：{error}"))?;
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始旧归档迁移失败：{error}"))?;
+    for (owner_uin, raw_json) in legacy {
+        if let Ok(feed) = serde_json::from_str::<Value>(&raw_json) {
+            save_original_dynamic(&transaction, &owner_uin, &feed)?;
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交旧归档迁移失败：{error}"))
+}
+
+fn text_at(value: &Value, pointer: &str) -> Option<String> {
+    value.pointer(pointer).and_then(|value| match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+}
+
+fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
+    let cell_id = text_at(feed, "/original/cell_id/cellid");
+    let event_time = feed
+        .pointer("/comm/time")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let event_type = feed
+        .pointer("/comm/subid")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let actor_uin = text_at(feed, "/userinfo/user/uin");
+    let feed_key = text_at(feed, "/comm/feedskey")
+        .or_else(|| text_at(feed, "/original/cell_comm/feedskey"))
+        .or_else(|| {
+            cell_id.as_ref().map(|id| {
+                format!(
+                    "{event_type}:{id}:{event_time}:{}",
+                    actor_uin.as_deref().unwrap_or("unknown")
+                )
+            })
+        })
+        .ok_or("动态记录缺少可用于去重的 feedskey 和 cell_id")?;
+    let pictures = feed.pointer("/original/cell_pic");
+    let picture_count = pictures
+        .and_then(|value| value.pointer("/picdata/pic"))
+        .and_then(Value::as_array)
+        .map(|items| items.len() as i64)
+        .unwrap_or(0);
+    let video = feed
+        .pointer("/original/cell_video")
+        .filter(|value| !value.is_null());
+    let comments = feed
+        .pointer("/original/cell_comment")
+        .filter(|value| !value.is_null());
+    Ok(ParsedFeed {
+        feed_key,
+        cell_id,
+        event_type,
+        event_time,
+        title: text_at(feed, "/title/title"),
+        content: text_at(feed, "/original/cell_summary/summary"),
+        event_summary: text_at(feed, "/summary/summary"),
+        actor_uin,
+        actor_name: text_at(feed, "/userinfo/user/nickname"),
+        original_author_uin: text_at(feed, "/original/cell_userinfo/user/uin"),
+        original_author_name: text_at(feed, "/original/cell_userinfo/user/nickname"),
+        picture_count,
+        pictures_json: pictures.map(Value::to_string),
+        video_json: video.map(Value::to_string),
+        comments_json: comments.map(Value::to_string),
+        raw_json: feed.to_string(),
+    })
+}
+
+fn save_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    feeds: &[Value],
+    next_cursor: Option<&str>,
+) -> Result<u64, String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("无法开始数据库事务：{error}"))?;
+    let mut saved = 0;
+    for feed in feeds {
+        save_original_dynamic(&transaction, owner_uin, feed)?;
+        let feed = parse_feed(feed)?;
+        let changed = transaction.execute(
+            "INSERT INTO archive_feeds
+             (owner_uin, feed_key, cell_id, event_type, event_time, title, content, event_summary,
+              actor_uin, actor_name, original_author_uin, original_author_name, picture_count,
+              pictures_json, video_json, comments_json, raw_json, archived_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+             ON CONFLICT(owner_uin, feed_key) DO UPDATE SET
+              cell_id=excluded.cell_id,event_type=excluded.event_type,event_time=excluded.event_time,
+              title=excluded.title,content=excluded.content,event_summary=excluded.event_summary,
+              actor_uin=excluded.actor_uin,actor_name=excluded.actor_name,
+              original_author_uin=excluded.original_author_uin,original_author_name=excluded.original_author_name,
+              picture_count=excluded.picture_count,pictures_json=excluded.pictures_json,
+              video_json=excluded.video_json,comments_json=excluded.comments_json,
+              raw_json=excluded.raw_json,archived_at=excluded.archived_at",
+            params![owner_uin, feed.feed_key, feed.cell_id, feed.event_type, feed.event_time,
+                feed.title, feed.content, feed.event_summary, feed.actor_uin, feed.actor_name,
+                feed.original_author_uin, feed.original_author_name, feed.picture_count,
+                feed.pictures_json, feed.video_json, feed.comments_json, feed.raw_json, now()],
+        ).map_err(|error| format!("保存动态失败：{error}"))?;
+        saved += changed as u64;
+    }
+    if let Some(cursor) = next_cursor {
+        transaction.execute(
+            "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
+             ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
+              pages=archive_checkpoints.pages+1,fetched=archive_checkpoints.fetched+excluded.fetched,
+              saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at",
+            params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+        ).map_err(|error| format!("保存归档续传位置失败：{error}"))?;
+    } else {
+        transaction
+            .execute(
+                "DELETE FROM archive_checkpoints WHERE owner_uin=?1",
+                params![owner_uin],
+            )
+            .map_err(|error| format!("清除归档续传位置失败：{error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交归档事务失败：{error}"))?;
+    Ok(saved)
+}
+
+struct ArchiveCheckpoint {
+    cursor: String,
+    pages: u32,
+    fetched: u64,
+    saved: u64,
+}
+
+const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
+const ARCHIVE_RATE_PAGE_LIMIT: i64 = 300;
+
+fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
+    let connection = open_database(app)?;
+    let current = now();
+    let state = connection.query_row(
+        "SELECT window_started_at,requested_pages FROM archive_rate_limits WHERE owner_uin=?1",
+        params![owner_uin], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    );
+    match state {
+        Ok((started_at, pages)) if current - started_at < ARCHIVE_RATE_WINDOW_SECONDS && pages >= ARCHIVE_RATE_PAGE_LIMIT => {
+            Ok(Some(started_at + ARCHIVE_RATE_WINDOW_SECONDS))
+        }
+        Ok((started_at, _)) if current - started_at >= ARCHIVE_RATE_WINDOW_SECONDS => {
+            connection.execute(
+                "UPDATE archive_rate_limits SET window_started_at=?2,requested_pages=1 WHERE owner_uin=?1",
+                params![owner_uin, current],
+            ).map_err(|error| format!("重置归档频率窗口失败：{error}"))?;
+            Ok(None)
+        }
+        Ok(_) => {
+            connection.execute(
+                "UPDATE archive_rate_limits SET requested_pages=requested_pages+1 WHERE owner_uin=?1",
+                params![owner_uin],
+            ).map_err(|error| format!("记录归档请求频率失败：{error}"))?;
+            Ok(None)
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            connection.execute(
+                "INSERT INTO archive_rate_limits(owner_uin,window_started_at,requested_pages) VALUES (?1,?2,1)",
+                params![owner_uin, current],
+            ).map_err(|error| format!("创建归档频率窗口失败：{error}"))?;
+            Ok(None)
+        }
+        Err(error) => Err(format!("读取归档请求频率失败：{error}")),
+    }
+}
+
+fn load_checkpoint(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<Option<ArchiveCheckpoint>, String> {
+    let connection = open_database(app)?;
+    match connection.query_row(
+        "SELECT attach_info,pages,fetched,saved FROM archive_checkpoints WHERE owner_uin=?1",
+        params![owner_uin],
+        |row| {
+            Ok(ArchiveCheckpoint {
+                cursor: row.get(0)?,
+                pages: row.get(1)?,
+                fetched: row.get(2)?,
+                saved: row.get(3)?,
+            })
+        },
+    ) {
+        Ok(checkpoint) if !checkpoint.cursor.trim().is_empty() => Ok(Some(checkpoint)),
+        Ok(_) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("读取归档续传位置失败：{error}")),
+    }
+}
+
+fn save_original_dynamic(
+    transaction: &rusqlite::Transaction<'_>,
+    owner_uin: &str,
+    feed: &Value,
+) -> Result<(), String> {
+    let Some(original) = feed.get("original") else {
+        return Ok(());
+    };
+    let Some(cell_id) = text_at(original, "/cell_id/cellid") else {
+        return Ok(());
+    };
+    let original_appid = original
+        .pointer("/cell_comm/appid")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let original_key = text_at(original, "/cell_comm/feedskey").unwrap_or_default();
+    let is_guestbook = original_appid == 334 || original_key.starts_with("334_");
+    let published_at = original
+        .pointer("/cell_comm/time")
+        .and_then(Value::as_i64)
+        .or_else(|| feed.pointer("/comm/time").and_then(Value::as_i64))
+        .unwrap_or(0);
+    let content = if is_guestbook {
+        text_at(feed, "/summary/summary")
+    } else {
+        text_at(original, "/cell_summary/summary")
+    };
+    let author_uin = if is_guestbook {
+        text_at(feed, "/userinfo/user/uin")
+    } else {
+        text_at(original, "/cell_userinfo/user/uin")
+    };
+    let author_name = if is_guestbook {
+        text_at(feed, "/userinfo/user/nickname")
+    } else {
+        text_at(original, "/cell_userinfo/user/nickname")
+    };
+    let category = if is_guestbook {
+        "guestbook"
+    } else if author_uin.as_deref() == Some(owner_uin) {
+        "self"
+    } else {
+        "other"
+    };
+    let pictures_json = original
+        .get("cell_pic")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
+    let video_json = original
+        .get("cell_video")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string);
+    transaction.execute(
+        "INSERT INTO archive_dynamics
+         (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
+          published_at=excluded.published_at,content=excluded.content,author_uin=excluded.author_uin,
+          author_name=excluded.author_name,category=excluded.category,pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
+          video_json=COALESCE(excluded.video_json,archive_dynamics.video_json),
+          raw_original_json=excluded.raw_original_json,archived_at=excluded.archived_at",
+        params![owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,original.to_string(),now()],
+    ).map_err(|error| format!("保存原动态失败：{error}"))?;
+    Ok(())
+}
+
+fn picture_urls(json: Option<String>) -> Vec<String> {
+    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
+        return vec![];
+    };
+    value
+        .pointer("/picdata/pic")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|pic| {
+            pic.pointer("/photourl/0/url")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    pic.get("photourl")?
+                        .as_object()?
+                        .values()
+                        .find_map(|item| item.get("url")?.as_str())
+                })
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn video_urls(json: Option<String>) -> Vec<String> {
+    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else { return vec![] };
+    let mut urls = Vec::new();
+    if let Some(url) = value.get("videourl").and_then(Value::as_str) { urls.push(url.to_owned()); }
+    if let Some(items) = value.get("videourls").and_then(Value::as_object) {
+        for url in items.values().filter_map(|item| item.get("url").and_then(Value::as_str)) {
+            if !urls.iter().any(|saved| saved == url) { urls.push(url.to_owned()); }
+        }
+    }
+    urls
+}
+
+fn video_cover_url(json: Option<String>) -> Option<String> {
+    let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    value
+        .pointer("/coverurl/0/url")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("coverurl")?
+                .as_object()?
+                .values()
+                .find_map(|item| item.get("url")?.as_str())
+        })
+        .map(str::to_owned)
+}
+
+#[tauri::command]
+pub async fn load_archived_video(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    id: i64,
+) -> Result<String, String> {
+    let auth = login.qzone_auth().await?;
+    let cache_dir = app.path().app_cache_dir().map_err(|error| format!("无法获取视频缓存目录：{error}"))?.join("videos");
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
+    let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
+    if cache_path.metadata().is_ok_and(|metadata| metadata.len() > 1024) {
+        return Ok(cache_path.to_string_lossy().into_owned());
+    }
+    let video_json = {
+        let connection = open_database(&app)?;
+        connection.query_row(
+            "SELECT video_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+            params![id, auth.uin],
+            |row| row.get::<_, Option<String>>(0),
+        ).map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条视频归档".into(),
+            _ => format!("读取视频归档失败：{error}"),
+        })?
+    };
+    let candidates = video_urls(video_json);
+    if candidates.is_empty() { return Err("该归档没有可用的视频地址".into()); }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(180))
+        .build().map_err(|error| format!("创建视频请求客户端失败：{error}"))?;
+    let mut last_error = String::new();
+    let mut rejected = false;
+    for url in candidates {
+        for (with_cookie, with_referer) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut request = client.get(&url)
+                .header(reqwest::header::USER_AGENT, &auth.user_agent)
+                .header(reqwest::header::ACCEPT, "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5")
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
+            if with_cookie { request = request.header(reqwest::header::COOKIE, &auth.cookie_header); }
+            if with_referer { request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/"); }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            let is_mp4 = bytes.get(4..12).is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
+                            if content_type.starts_with("video/") || content_type.contains("octet-stream") || is_mp4 {
+                                fs::write(&cache_path, &bytes).map_err(|error| format!("写入视频缓存失败：{error}"))?;
+                                return Ok(cache_path.to_string_lossy().into_owned());
+                            }
+                            last_error = format!("QQ 返回了非视频内容（{}）", if content_type.is_empty() { "未知类型" } else { &content_type });
+                        }
+                        Err(error) => last_error = format!("读取视频数据失败：{error}"),
+                    }
+                }
+                Ok(response) => {
+                    rejected |= response.status() == reqwest::StatusCode::FORBIDDEN;
+                    last_error = format!("HTTP {}", response.status());
+                }
+                Err(error) => last_error = format!("请求视频失败：{error}"),
+            }
+        }
+    }
+    if rejected { Err("QQ 拒绝了视频请求（HTTP 403），该归档的视频临时签名可能已经过期，请重新归档以更新视频地址".into()) }
+    else { Err(format!("所有视频地址均加载失败：{last_error}")) }
+}
+
+fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress)) {
+    if let Ok(mut progress) = state.progress.lock() {
+        update(&mut progress);
+    }
+}
+
+#[tauri::command]
+pub async fn start_feed_archive(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    archive: tauri::State<'_, ArchiveState>,
+    interval_ms: u64,
+) -> Result<ArchiveProgress, String> {
+    let interval_ms = interval_ms.clamp(500, 30_000);
+    {
+        let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
+        if progress.status == "running" {
+            return Err("已有归档任务正在运行".into());
+        }
+        *progress = ArchiveProgress {
+            status: "running",
+            pages: 0,
+            fetched: 0,
+            saved: 0,
+            message: "正在准备归档…".into(),
+            retry_at: None,
+        };
+    }
+    archive.cancel.store(false, Ordering::Relaxed);
+    let owner_uin = login.qzone_auth().await?.uin;
+    let checkpoint = load_checkpoint(&app, &owner_uin)?;
+    let mut cursor = checkpoint.as_ref().map(|value| value.cursor.clone());
+    let mut seen_cursors = HashSet::new();
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        let saved_cursor = &checkpoint.cursor;
+        seen_cursors.insert(saved_cursor.clone());
+        set_progress(&archive, |progress| {
+            progress.pages = checkpoint.pages;
+            progress.fetched = checkpoint.fetched;
+            progress.saved = checkpoint.saved;
+            progress.message = format!("已恢复上次进度：{} 页，正在继续归档…", checkpoint.pages);
+        });
+    }
+    let result: Result<(), String> = async {
+        loop {
+            if archive.cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
+                return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+            }
+            let page = if let Some(current_cursor) = cursor.as_deref() {
+                qzone::fetch_feeds(&login, "2", Some(current_cursor)).await?
+            } else {
+                qzone::fetch_feeds(&login, "1", None).await?
+            };
+            let fetched = page.feeds.len() as u64;
+            let next = if page.has_more {
+                Some(
+                    page.attach_info
+                        .as_deref()
+                        .ok_or("接口表示还有数据，但未返回分页游标")?,
+                )
+            } else {
+                None
+            };
+            if let Some(next_cursor) = next {
+                if !seen_cursors.insert(next_cursor.to_owned()) {
+                    return Err("检测到重复分页游标，已停止以避免死循环".into());
+                }
+            }
+            let saved = save_page(&app, &owner_uin, &page.feeds, next)?;
+            set_progress(&archive, |progress| {
+                progress.pages += 1;
+                progress.fetched += fetched;
+                progress.saved += saved;
+                progress.message = format!(
+                    "已归档 {} 页，共 {} 条记录",
+                    progress.pages, progress.fetched
+                );
+            });
+            if !page.has_more {
+                return Ok(());
+            }
+            cursor = next.map(str::to_owned);
+            let jitter = (now() as u64 % interval_ms.max(1)) + (interval_ms / 2);
+            tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+        }
+    }
+    .await;
+    match &result {
+        Ok(()) if archive.cancel.load(Ordering::Relaxed) => set_progress(&archive, |p| {
+            p.status = "cancelled";
+            p.message = "归档已取消".into();
+            p.retry_at = None;
+        }),
+        Ok(()) => set_progress(&archive, |p| {
+            p.status = "completed";
+            p.message = format!("归档完成，共保存 {} 条记录", p.saved);
+            p.retry_at = None;
+        }),
+        Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => set_progress(&archive, |p| {
+            let retry_at = error.trim_start_matches("ARCHIVE_RATE_LIMIT:").parse::<i64>().ok();
+            p.status = "limited";
+            p.retry_at = retry_at;
+            p.message = "为防止接口请求过于频繁，每 10 分钟最多归档 300 页。达到限制后已安全暂停，倒计时结束即可从当前进度继续归档。".into();
+        }),
+        Err(_error) => set_progress(&archive, |p| {
+            let detail = serde_json::json!({
+                "event": "qzone_archive_task_error",
+                "error": _error,
+                "pages": p.pages,
+                "fetched": p.fetched,
+                "saved": p.saved,
+                "ownerUin": owner_uin,
+            });
+            eprintln!(
+                "\n================ QZONE ARCHIVE TASK ERROR ================\n{}\n================ END QZONE ARCHIVE TASK ERROR ================\n",
+                serde_json::to_string_pretty(&detail).unwrap_or_else(|_| detail.to_string())
+            );
+            p.status = "error";
+            p.message = "服务繁忙，请稍后再试".into();
+            p.retry_at = None;
+        }),
+    }
+    let progress = archive
+        .progress
+        .lock()
+        .map_err(|_| "归档状态锁已损坏")?
+        .clone();
+    if result.as_ref().is_err_and(|error| error.starts_with("ARCHIVE_RATE_LIMIT:")) { Ok(progress) }
+    else { result.map(|_| progress) }
+}
+
+#[tauri::command]
+pub fn get_archive_progress(
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<ArchiveProgress, String> {
+    state
+        .progress
+        .lock()
+        .map(|value| value.clone())
+        .map_err(|_| "归档状态锁已损坏".into())
+}
+
+#[tauri::command]
+pub fn cancel_feed_archive(state: tauri::State<'_, ArchiveState>) {
+    state.cancel.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub async fn list_archived_feeds(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    limit: u32,
+    offset: u32,
+    category: String,
+) -> Result<Vec<ArchiveItem>, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+              (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC LIMIT ?3 OFFSET ?4",
+        )
+        .map_err(|error| format!("读取归档失败：{error}"))?;
+    let rows = statement
+        .query_map(
+            params![owner_uin, category, limit.clamp(1, 200), offset],
+            |row| {
+                let video_json = row.get::<_, Option<String>>(8)?;
+                let video_urls = video_urls(video_json.clone());
+                Ok(ArchiveItem {
+                    id: row.get(0)?,
+                    owner_uin: row.get(1)?,
+                    cell_id: row.get(2)?,
+                    published_at: row.get(3)?,
+                    content: row.get(4)?,
+                    author_uin: row.get(5)?,
+                    author_name: row.get(6)?,
+                    picture_urls: picture_urls(row.get(7)?),
+                    video_url: video_urls.first().cloned(),
+                    video_urls,
+                    video_cover_url: video_cover_url(video_json),
+                    like_count: row.get(9)?,
+                    comment_count: row.get(10)?,
+                    likes: vec![],
+                    comments: vec![],
+                })
+            },
+        )
+        .map_err(|error| format!("查询归档失败：{error}"))?;
+    let mut items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取归档记录失败：{error}"))?;
+    drop(statement);
+    let mut comment_statement = connection
+        .prepare(
+            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
+        )
+        .map_err(|error| format!("准备评论查询失败：{error}"))?;
+    for item in &mut items {
+        let comments = comment_statement
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?;
+        item.comments = comments.filter_map(Result::ok).collect();
+    }
+    drop(comment_statement);
+    let mut like_statement = connection
+        .prepare(
+            "SELECT actor_uin,actor_name FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+        )
+        .map_err(|error| format!("准备点赞查询失败：{error}"))?;
+    for item in &mut items {
+        let likes = like_statement
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(LikeUser {
+                    uin: row.get(0)?,
+                    nickname: row.get(1)?,
+                })
+            })
+            .map_err(|error| format!("查询点赞用户失败：{error}"))?;
+        item.likes = likes.filter_map(Result::ok).collect();
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn list_archived_media(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    limit: u32,
+    offset: u32,
+    year: Option<i32>,
+) -> Result<ArchiveMediaPage, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut year_statement = connection.prepare(
+        "SELECT DISTINCT CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER) FROM archive_dynamics
+         WHERE owner_uin=?1 AND category IN ('self','other') AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
+         ORDER BY 1 DESC",
+    ).map_err(|error| format!("读取媒体年份失败：{error}"))?;
+    let years = year_statement.query_map(params![owner_uin], |row| row.get::<_, i32>(0))
+        .map_err(|error| format!("查询媒体年份失败：{error}"))?
+        .filter_map(Result::ok).collect::<Vec<_>>();
+    drop(year_statement);
+
+    let mut statement = connection.prepare(
+        "SELECT id,published_at,content,author_uin,author_name,pictures_json,video_json FROM archive_dynamics
+         WHERE owner_uin=?1 AND category IN ('self','other')
+           AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
+           AND (?2 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?2)
+         ORDER BY published_at ASC,id ASC",
+    ).map_err(|error| format!("读取媒体归档失败：{error}"))?;
+    let rows = statement.query_map(params![owner_uin, year], |row| Ok((
+        row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?,
+        row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?,
+        row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?,
+    ))).map_err(|error| format!("查询媒体归档失败：{error}"))?;
+    let mut all = Vec::new();
+    for row in rows {
+        let (id, published_at, content, author_uin, author_name, pictures_json, video_json) =
+            row.map_err(|error| format!("读取媒体记录失败：{error}"))?;
+        for (index, url) in picture_urls(pictures_json).into_iter().enumerate() {
+            all.push(ArchiveMediaItem { key: format!("{id}-photo-{index}"), dynamic_id: id, media_type: "photo", url,
+                cover_url: None, published_at, author_uin: author_uin.clone(), author_name: author_name.clone(), content: content.clone() });
+        }
+        let videos = video_urls(video_json.clone());
+        if let Some(url) = videos.first() {
+            all.push(ArchiveMediaItem { key: format!("{id}-video"), dynamic_id: id, media_type: "video", url: url.clone(),
+                cover_url: video_cover_url(video_json), published_at, author_uin, author_name, content });
+        }
+    }
+    let total = all.len();
+    let start = (offset as usize).min(total);
+    let end = (start + limit.clamp(1, 100) as usize).min(total);
+    let items = all.drain(start..end).collect();
+    Ok(ArchiveMediaPage { items, total, years })
+}
+
+#[tauri::command]
+pub async fn get_archived_feed(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    id: i64,
+) -> Result<ArchiveItem, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut item = connection.query_row(
+        "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.id=?2",
+        params![owner_uin, id], |row| {
+            let video_json = row.get::<_, Option<String>>(8)?;
+            let video_urls = video_urls(video_json.clone());
+            Ok(ArchiveItem { id: row.get(0)?, owner_uin: row.get(1)?, cell_id: row.get(2)?, published_at: row.get(3)?,
+                content: row.get(4)?, author_uin: row.get(5)?, author_name: row.get(6)?, picture_urls: picture_urls(row.get(7)?),
+                video_url: video_urls.first().cloned(), video_urls, video_cover_url: video_cover_url(video_json),
+                like_count: row.get(9)?, comment_count: row.get(10)?, likes: vec![], comments: vec![] })
+        },
+    ).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => "原始动态不存在或已删除".into(), _ => format!("读取原始动态失败：{error}") })?;
+    let mut comments = connection.prepare(
+        "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
+    ).map_err(|error| format!("准备评论查询失败：{error}"))?;
+    item.comments = comments.query_map(params![item.owner_uin, item.cell_id], |row| Ok(comment_from_values(
+        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+        .map_err(|error| format!("查询动态评论失败：{error}"))?.filter_map(Result::ok).collect();
+    drop(comments);
+    let mut likes_stmt = connection.prepare(
+        "SELECT actor_uin,actor_name FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+    ).map_err(|error| format!("准备点赞查询失败：{error}"))?;
+    item.likes = likes_stmt.query_map(params![item.owner_uin, item.cell_id], |row| {
+        Ok(LikeUser { uin: row.get(0)?, nickname: row.get(1)? })
+    }).map_err(|error| format!("查询点赞用户失败：{error}"))?.filter_map(Result::ok).collect();
+    Ok(item)
+}
+
+fn comment_from_values(
+    json: Option<String>,
+    fallback_uin: Option<String>,
+    fallback_name: Option<String>,
+    fallback_content: Option<String>,
+    fallback_time: i64,
+) -> ArchiveComment {
+    let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let main = value.as_ref().and_then(|value| value.get("main_comment"));
+    let replies = main
+        .and_then(|value| value.get("replys"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(reply_from_value)
+        .collect();
+    ArchiveComment {
+        uin: main
+            .and_then(|value| text_at(value, "/user/uin"))
+            .or(fallback_uin),
+        nickname: main
+            .and_then(|value| text_at(value, "/user/nickname"))
+            .or(fallback_name),
+        content: main
+            .and_then(|value| text_at(value, "/content"))
+            .or(fallback_content)
+            .unwrap_or_else(|| "评论了这条动态".into()),
+        created_at: main
+            .and_then(|value| value.get("date"))
+            .and_then(Value::as_i64)
+            .unwrap_or(fallback_time),
+        replies,
+    }
+}
+
+fn reply_from_value(value: &Value) -> Option<ArchiveReply> {
+    let content = text_at(value, "/content")?;
+    Some(ArchiveReply {
+        uin: text_at(value, "/user/uin").or_else(|| text_at(value, "/replyuser/uin")),
+        nickname: text_at(value, "/user/nickname")
+            .or_else(|| text_at(value, "/replyuser/nickname")),
+        content,
+        created_at: value.get("date").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+fn validate_category(category: &str) -> Result<(), String> {
+    match category {
+        "self" | "other" | "guestbook" => Ok(()),
+        _ => Err("无效的归档分类".into()),
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn qzone_text_html(value: Option<&str>) -> String {
+    let text = value
+        .unwrap_or("")
+        .trim_start_matches(['：', ':'])
+        .trim_start();
+    let pattern =
+        regex::Regex::new(r"@\{uin:([^,}]+),nick:([^}]+)\}").expect("fixed mention regex");
+    let mut html = String::new();
+    let mut cursor = 0;
+    for captures in pattern.captures_iter(text) {
+        let matched = captures.get(0).expect("full capture");
+        html.push_str(&html_escape(&text[cursor..matched.start()]));
+        html.push_str("<span class=\"mention\" title=\"QQ ");
+        html.push_str(&html_escape(&captures[1]));
+        html.push_str("\">@");
+        html.push_str(&html_escape(&captures[2]));
+        html.push_str("</span>");
+        cursor = matched.end();
+    }
+    html.push_str(&html_escape(&text[cursor..]));
+    if html.is_empty() {
+        "<span class=\"muted\">该动态没有文字内容</span>".into()
+    } else {
+        html
+    }
+}
+
+fn archive_items_for_export(
+    connection: &Connection,
+    owner_uin: &str,
+    category: &str,
+    selected_ids: Option<&HashSet<i64>>,
+) -> Result<Vec<ArchiveItem>, String> {
+    let mut statement = connection.prepare(
+        "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
+          (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
+         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC"
+    ).map_err(|error| format!("准备导出查询失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin, category], |row| {
+            let video_json = row.get::<_, Option<String>>(8)?;
+            let video_urls = video_urls(video_json.clone());
+            Ok(ArchiveItem {
+                id: row.get(0)?,
+                owner_uin: row.get(1)?,
+                cell_id: row.get(2)?,
+                published_at: row.get(3)?,
+                content: row.get(4)?,
+                author_uin: row.get(5)?,
+                author_name: row.get(6)?,
+                picture_urls: picture_urls(row.get(7)?),
+                video_url: video_urls.first().cloned(),
+                video_urls,
+                video_cover_url: video_cover_url(video_json),
+                like_count: row.get(9)?,
+                comment_count: row.get(10)?,
+                likes: vec![],
+                comments: vec![],
+            })
+        })
+        .map_err(|error| format!("查询导出内容失败：{error}"))?;
+    let mut items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取导出内容失败：{error}"))?;
+    if let Some(ids) = selected_ids {
+        items.retain(|item| ids.contains(&item.id));
+    }
+    drop(statement);
+    let mut comments = connection
+        .prepare(
+            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
+        )
+        .map_err(|error| format!("准备导出评论失败：{error}"))?;
+    for item in &mut items {
+        let rows = comments
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询导出评论失败：{error}"))?;
+        item.comments = rows.filter_map(Result::ok).collect();
+    }
+    drop(comments);
+    let mut export_likes = connection
+        .prepare(
+            "SELECT actor_uin,actor_name FROM archive_feeds
+         WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
+        )
+        .map_err(|error| format!("准备导出点赞查询失败：{error}"))?;
+    for item in &mut items {
+        let likes = export_likes
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(LikeUser { uin: row.get(0)?, nickname: row.get(1)? })
+            })
+            .map_err(|error| format!("查询导出点赞用户失败：{error}"))?;
+        item.likes = likes.filter_map(Result::ok).collect();
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn export_archived_html(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+    ids: Option<Vec<i64>>,
+) -> Result<String, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    if selected.as_ref().is_some_and(HashSet::is_empty) {
+        return Err("请先选择需要导出的归档".into());
+    }
+    let connection = open_database(&app)?;
+    let items = archive_items_for_export(&connection, &owner_uin, &category, selected.as_ref())?;
+    if items.is_empty() {
+        return Err("当前分类没有可以导出的归档".into());
+    }
+    let category_name = match category.as_str() {
+        "self" => "本人动态",
+        "other" => "其他动态",
+        _ => "留言",
+    };
+    let mut cards = String::new();
+    for item in &items {
+        let author = item
+            .author_name
+            .as_deref()
+            .or(item.author_uin.as_deref())
+            .unwrap_or("QQ 用户");
+        cards.push_str("<article class=\"card\"><header><img class=\"avatar\" src=\"https://qlogo2.store.qq.com/qzone/");
+        let uin = item.author_uin.as_deref().unwrap_or("0");
+        cards.push_str(&html_escape(uin));
+        cards.push('/');
+        cards.push_str(&html_escape(uin));
+        cards.push_str("/50\"><div><strong>");
+        cards.push_str(&html_escape(author));
+        cards.push_str("</strong><small>");
+        if let Some(author_uin) = &item.author_uin {
+            cards.push_str("QQ ");
+            cards.push_str(&html_escape(author_uin));
+            cards.push_str(" · ");
+        }
+        cards.push_str("<time data-time=\"");
+        cards.push_str(&item.published_at.to_string());
+        cards.push_str("\"></time></small></div></header><div class=\"content\">");
+        cards.push_str(&qzone_text_html(item.content.as_deref()));
+        cards.push_str("</div>");
+        if !item.picture_urls.is_empty() {
+            cards.push_str("<div class=\"pictures\">");
+            for url in &item.picture_urls {
+                cards.push_str("<a href=\"");
+                cards.push_str(&html_escape(url));
+                cards.push_str("\" target=\"_blank\"><img loading=\"lazy\" referrerpolicy=\"no-referrer\" src=\"");
+                cards.push_str(&html_escape(url));
+                cards.push_str("\"></a>");
+            }
+            cards.push_str("</div>");
+        }
+        if let Some(video) = &item.video_url {
+            cards.push_str("<p><a class=\"video\" href=\"");
+            cards.push_str(&html_escape(video));
+            cards.push_str("\" target=\"_blank\">▶ 查看视频</a></p>");
+        }
+        cards.push_str("<div class=\"stats\">");
+        if !item.likes.is_empty() {
+            cards.push_str("♥ ");
+            let names: Vec<String> = item.likes.iter().take(10).map(|l| {
+                html_escape(l.nickname.as_deref().or(l.uin.as_deref()).unwrap_or("QQ用户"))
+            }).collect();
+            cards.push_str(&names.join("、"));
+            if item.likes.len() > 10 {
+                cards.push_str(" 等 ");
+                cards.push_str(&item.like_count.to_string());
+                cards.push_str(" 人赞了");
+            } else {
+                cards.push_str(" 赞了");
+            }
+        }
+        cards.push_str("　💬 ");
+        cards.push_str(&item.comment_count.to_string());
+        cards.push_str(" 条评论</div>");
+        if !item.comments.is_empty() {
+            cards.push_str("<section class=\"comments\">");
+            for comment in &item.comments {
+                cards.push_str("<div class=\"comment\"><b>");
+                cards.push_str(&html_escape(
+                    comment
+                        .nickname
+                        .as_deref()
+                        .or(comment.uin.as_deref())
+                        .unwrap_or("QQ 用户"),
+                ));
+                cards.push_str("</b> ");
+                cards.push_str(&qzone_text_html(Some(&comment.content)));
+                if !comment.replies.is_empty() {
+                    cards.push_str("<div class=\"replies\">");
+                    for reply in &comment.replies {
+                        cards.push_str("<div><b>");
+                        cards.push_str(&html_escape(
+                            reply
+                                .nickname
+                                .as_deref()
+                                .or(reply.uin.as_deref())
+                                .unwrap_or("QQ 用户"),
+                        ));
+                        cards.push_str("</b> ");
+                        cards.push_str(&qzone_text_html(Some(&reply.content)));
+                        cards.push_str("</div>");
+                    }
+                    cards.push_str("</div>");
+                }
+                cards.push_str("</div>");
+            }
+            cards.push_str("</section>");
+        }
+        cards.push_str("</article>");
+    }
+    Ok(format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
+        owner = html_escape(&owner_uin),
+        count = items.len()
+    ))
+}
+
+#[tauri::command]
+pub async fn count_archived_feeds(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    category: String,
+) -> Result<u64, String> {
+    validate_category(&category)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
+            params![owner_uin, category],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| format!("统计归档数量失败：{error}"))
+}
+
+#[tauri::command]
+pub async fn get_archive_overview(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<ArchiveOverview, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let database = database_path(&app)?;
+    let connection = open_database(&app)?;
+    let dynamics = connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1",
+            params![owner_uin],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("统计原动态失败：{error}"))?
+        .max(0) as u64;
+    let (likes, comments) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END),0)
+         FROM archive_feeds WHERE owner_uin=?1",
+            params![owner_uin],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|error| format!("统计互动记录失败：{error}"))?;
+    let mut statement = connection.prepare("SELECT pictures_json FROM archive_dynamics WHERE owner_uin=?1 AND pictures_json IS NOT NULL")
+        .map_err(|error| format!("读取图片统计失败：{error}"))?;
+    let pictures = statement
+        .query_map(params![owner_uin], |row| row.get::<_, Option<String>>(0))
+        .map_err(|error| format!("查询图片统计失败：{error}"))?
+        .filter_map(Result::ok)
+        .map(|json| picture_urls(json).len() as u64)
+        .sum();
+    let database_bytes = fs::metadata(database).map(|value| value.len()).unwrap_or(0);
+    Ok(ArchiveOverview {
+        dynamics,
+        pictures,
+        comments: comments.max(0) as u64,
+        likes: likes.max(0) as u64,
+        database_bytes,
+    })
+}
+
+#[tauri::command]
+pub async fn get_interaction_ranking(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    limit: u32,
+) -> Result<Vec<InteractionRank>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut statement = connection.prepare(
+        "SELECT actor_uin,COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),COUNT(*),
+                SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END)
+         FROM archive_feeds
+         WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>'' AND actor_uin<>?1
+           AND event_type IN (2,217,311)
+         GROUP BY actor_uin
+         ORDER BY COUNT(*) DESC,MAX(event_time) DESC
+         LIMIT ?2"
+    ).map_err(|error| format!("准备互动排行榜查询失败：{error}"))?;
+    let rows = statement.query_map(params![owner_uin, limit.clamp(1, 50)], |row| {
+        Ok(InteractionRank {
+            uin: row.get(0)?, nickname: row.get(1)?,
+            interactions: row.get::<_, i64>(2)?.max(0) as u64,
+            likes: row.get::<_, i64>(3)?.max(0) as u64,
+            comments: row.get::<_, i64>(4)?.max(0) as u64,
+        })
+    }).map_err(|error| format!("查询互动排行榜失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("读取互动排行榜失败：{error}"))
+}
+
+fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
+    let progress = state.progress.lock().map_err(|_| "归档状态锁已损坏")?;
+    if progress.status == "running" {
+        return Err("归档任务运行时不能删除数据，请先取消任务".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_archived_feeds(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    ids: Vec<i64>,
+) -> Result<u64, String> {
+    ensure_archive_idle(&state)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if ids.len() > 500 {
+        return Err("单次最多删除 500 条归档记录".into());
+    }
+    let mut connection = open_database(&app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("开始删除事务失败：{error}"))?;
+    let mut count = 0;
+    for id in ids {
+        transaction.execute(
+            "DELETE FROM archive_feeds WHERE owner_uin=?1 AND cell_id=(SELECT cell_id FROM archive_dynamics WHERE id=?2 AND owner_uin=?1)",
+            params![owner_uin, id],
+        ).map_err(|error| format!("删除动态互动失败：{error}"))?;
+        count += transaction
+            .execute(
+                "DELETE FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                params![id, owner_uin],
+            )
+            .map_err(|error| format!("批量删除归档失败：{error}"))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("提交删除事务失败：{error}"))?;
+    Ok(count as u64)
+}
+
+#[tauri::command]
+pub async fn clear_archived_feeds(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<u64, String> {
+    ensure_archive_idle(&state)?;
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let dynamics = connection
+        .execute(
+            "DELETE FROM archive_dynamics WHERE owner_uin=?1",
+            params![owner_uin],
+        )
+        .map_err(|error| format!("清空原动态失败：{error}"))?;
+    connection
+        .execute(
+            "DELETE FROM archive_feeds WHERE owner_uin=?1",
+            params![owner_uin],
+        )
+        .map_err(|error| format!("清空互动记录失败：{error}"))?;
+    connection
+        .execute(
+            "DELETE FROM archive_checkpoints WHERE owner_uin=?1",
+            params![owner_uin],
+        )
+        .map_err(|error| format!("清空归档续传位置失败：{error}"))?;
+    connection
+        .execute("DELETE FROM archive_rate_limits WHERE owner_uin=?1", params![owner_uin])
+        .map_err(|error| format!("清空归档频率记录失败：{error}"))?;
+    Ok(dynamics as u64)
+}
+
+#[tauri::command]
+pub async fn delete_all_app_data(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+) -> Result<(), String> {
+    ensure_archive_idle(&state)?;
+    login.clear_session().await;
+    let database = database_path(&app)?;
+    for path in [database.clone(), PathBuf::from(format!("{}-wal", database.display())), PathBuf::from(format!("{}-shm", database.display()))] {
+        if path.exists() { fs::remove_file(&path).map_err(|error| format!("删除应用数据库失败：{error}"))?; }
+    }
+    let videos = app.path().app_cache_dir().map_err(|error| format!("无法获取缓存目录：{error}"))?.join("videos");
+    if videos.exists() { fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?; }
+    if let Ok(mut progress) = state.progress.lock() { *progress = ArchiveProgress::default(); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_feed;
+    use serde_json::json;
+
+    #[test]
+    fn parses_like_event_sample_shape() {
+        let feed = json!({"comm":{"feedskey":"217_3_key","subid":217,"time":1752553379},
+          "original":{"cell_id":{"cellid":"mood1"},"cell_summary":{"summary":"：纪念"},
+          "cell_userinfo":{"user":{"uin":"1","nickname":"主人"}},"cell_video":{"videoid":"v1"}},
+          "title":{"title":"赞了我"},"userinfo":{"user":{"uin":"2","nickname":"访客"}}});
+        let parsed = parse_feed(&feed).unwrap();
+        assert_eq!(parsed.feed_key, "217_3_key");
+        assert_eq!(parsed.event_type, 217);
+        assert!(parsed.video_json.is_some());
+    }
+
+    #[test]
+    fn parses_comment_and_picture_sample_shape() {
+        let feed = json!({"comm":{"feedskey":"311_2_key","subid":2,"time":1751637966},
+          "original":{"cell_id":{"cellid":"mood2"},"cell_summary":{"summary":"：哼哧哼哧"},
+          "cell_pic":{"picdata":{"pic":[{},{}]}},"cell_comment":{"main_comment":{"content":"评论"}}},
+          "summary":{"summary":"又幸福上了"},"userinfo":{"user":{"uin":"3","nickname":"评论者"}}});
+        let parsed = parse_feed(&feed).unwrap();
+        assert_eq!(parsed.event_type, 2);
+        assert_eq!(parsed.picture_count, 2);
+        assert!(parsed.comments_json.is_some());
+    }
+}
