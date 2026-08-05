@@ -32,6 +32,7 @@ pub fn run() {
             archive::get_archived_feed,
             archive::count_archived_feeds,
             archive::export_archived_html,
+            archive::load_archived_image,
             archive::load_archived_video,
             archive::get_archive_overview,
             archive::get_interaction_ranking,

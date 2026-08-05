@@ -10,7 +10,7 @@ import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import InputText from "primevue/inputtext";
 import Paginator, { type PageState } from "primevue/paginator";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
+import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 import { parseQzoneText } from "../utils/qzoneText";
 
 type DeleteAction = "selected" | "all";
@@ -39,6 +39,7 @@ const videoLoading = reactive<Record<number, boolean>>({});
 const videoErrors = reactive<Record<number, string>>({});
 const imageSources = reactive<Record<string, string>>({});
 const imageLoading = reactive<Record<string, boolean>>({});
+const imageErrors = reactive<Record<string, string>>({});
 const imagePreviewVisible = ref(false);
 const previewImageUrl = ref("");
 const previewImageName = ref("qzone-image.jpg");
@@ -87,6 +88,7 @@ function releaseVideos() {
   Object.values(imageSources).forEach((url) => URL.revokeObjectURL(url));
   Object.keys(imageSources).forEach((key) => delete imageSources[key]);
   Object.keys(imageLoading).forEach((key) => delete imageLoading[key]);
+  Object.keys(imageErrors).forEach((key) => delete imageErrors[key]);
 }
 function observeArchiveImages() {
   imageObserver?.disconnect();
@@ -95,22 +97,29 @@ function observeArchiveImages() {
       if (!entry.isIntersecting) continue;
       const element = entry.target as HTMLElement;
       const url = element.dataset.archiveImage;
-      if (url) void loadArchiveImage(url);
+      const dynamicId = Number(element.dataset.dynamicId);
+      const pictureIndex = Number(element.dataset.pictureIndex);
+      if (url) void loadArchiveImage(url, Number.isFinite(dynamicId) ? dynamicId : undefined, Number.isFinite(pictureIndex) ? pictureIndex : undefined);
       imageObserver?.unobserve(element);
     }
   }, { rootMargin: "240px 0px" });
   document.querySelectorAll<HTMLElement>(".archive-page [data-archive-image]").forEach((element) => imageObserver?.observe(element));
 }
-async function loadArchiveImage(url: string) {
+async function loadArchiveImage(url: string, dynamicId?: number, pictureIndex?: number) {
   if (!url || imageSources[url] || imageLoading[url]) return;
   imageLoading[url] = true;
+  delete imageErrors[url];
   try {
-    const response = await fetch(url, { method: "GET", headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" } });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const bytes = await response.arrayBuffer();
-    const contentType = response.headers.get("content-type") || "image/jpeg";
-    imageSources[url] = URL.createObjectURL(new Blob([bytes], { type: contentType }));
-  } catch (reason) { console.error("归档图片加载失败", reason); }
+    if (dynamicId !== undefined && pictureIndex !== undefined) {
+      imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+    } else {
+      const response = await fetch(url, { method: "GET", headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" } });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const bytes = await response.arrayBuffer();
+      const contentType = response.headers.get("content-type") || "image/jpeg";
+      imageSources[url] = URL.createObjectURL(new Blob([bytes], { type: contentType }));
+    }
+  } catch (reason) { imageErrors[url] = String(reason); console.error("归档图片加载失败", reason); }
   finally { imageLoading[url] = false; }
 }
 function imageExtension(url: string) {
@@ -266,7 +275,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
       <div class="archive-card-body">
         <header class="archive-dynamic-header"><span class="archive-avatar archive-publisher-avatar"><img v-if="item.authorUin" :src="avatarUrl(item.authorUin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span><div class="archive-publisher"><strong>{{ item.authorName || "我" }}</strong><span><span v-if="item.authorUin">QQ {{ item.authorUin }}</span><span>{{ formatTime(item.publishedAt) }}</span></span></div></header>
         <p class="archive-dynamic-content"><span v-for="(part, index) in parseQzoneText(item.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }" :title="part.uin ? `QQ ${part.uin}` : undefined">{{ part.value }}</span></p>
-        <div v-if="item.pictureUrls.length" class="archive-picture-grid" :class="`pictures-${Math.min(item.pictureUrls.length, 4)}`"><template v-for="(url, pictureIndex) in item.pictureUrls.slice(0, 4)" :key="url"><button v-if="imageSources[url]" type="button" class="archive-picture-button" :aria-label="`查看动态图片 ${pictureIndex + 1}`" @click="openImagePreview(imageSources[url], url, item.cellId, pictureIndex)"><img :src="imageSources[url]" :alt="`动态图片 ${pictureIndex + 1}`" /></button><div v-else class="archive-image-loading" :data-archive-image="url"><i class="pi pi-image" /><span>{{ imageLoading[url] ? "加载中" : "等待加载" }}</span></div></template><span v-if="item.pictureUrls.length > 4" class="picture-more">+{{ item.pictureUrls.length - 4 }}</span></div>
+        <div v-if="item.pictureUrls.length" class="archive-picture-grid" :class="`pictures-${Math.min(item.pictureUrls.length, 4)}`"><template v-for="(url, pictureIndex) in item.pictureUrls.slice(0, 4)" :key="url"><button v-if="imageSources[url]" type="button" class="archive-picture-button" :aria-label="`查看动态图片 ${pictureIndex + 1}`" @click="openImagePreview(imageSources[url], url, item.cellId, pictureIndex)"><img :src="imageSources[url]" :alt="`动态图片 ${pictureIndex + 1}`" /></button><div v-else class="archive-image-loading" :data-archive-image="url" :data-dynamic-id="item.id" :data-picture-index="pictureIndex"><i class="pi pi-image" /><button v-if="imageErrors[url]" type="button" class="archive-image-retry" :title="imageErrors[url]" @click.stop="loadArchiveImage(url, item.id, pictureIndex)">加载失败，重试</button><span v-else>{{ imageLoading[url] ? "正在尝试多个图片地址" : "等待加载" }}</span></div></template><span v-if="item.pictureUrls.length > 4" class="picture-more">+{{ item.pictureUrls.length - 4 }}</span></div>
         <video v-if="videoSources[item.id]" :id="`archive-video-${item.id}`" class="archive-video" :src="videoSources[item.id]" controls preload="metadata" playsinline />
         <div v-else-if="item.videoUrl" class="archive-video-cover" :class="{ 'is-loading': videoLoading[item.id] }" :data-archive-image="item.videoCoverUrl || undefined" role="button" tabindex="0" @click="loadVideo(item)" @keydown.enter="loadVideo(item)">
           <img v-if="item.videoCoverUrl && imageSources[item.videoCoverUrl]" :src="imageSources[item.videoCoverUrl]" />

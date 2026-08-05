@@ -129,6 +129,7 @@ pub struct ArchiveMediaItem {
     key: String,
     dynamic_id: i64,
     media_type: &'static str,
+    picture_index: Option<usize>,
     url: String,
     cover_url: Option<String>,
     published_at: i64,
@@ -896,7 +897,7 @@ fn save_original_dynamic(
     Ok(())
 }
 
-fn picture_urls(json: Option<String>) -> Vec<String> {
+fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
     let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
         return vec![];
     };
@@ -906,17 +907,176 @@ fn picture_urls(json: Option<String>) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|pic| {
-            pic.pointer("/photourl/0/url")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    pic.get("photourl")?
-                        .as_object()?
-                        .values()
-                        .find_map(|item| item.get("url")?.as_str())
+            let photo_urls = pic.get("photourl")?;
+            let values = match photo_urls {
+                Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                Value::Object(items) => items.values().collect::<Vec<_>>(),
+                _ => vec![],
+            };
+            let mut candidates = values
+                .into_iter()
+                .filter_map(|item| {
+                    let url = item.get("url")?.as_str()?.trim();
+                    if url.is_empty() {
+                        return None;
+                    }
+                    let dimension = |name: &str| {
+                        item.get(name)
+                            .and_then(|value| {
+                                value
+                                    .as_u64()
+                                    .or_else(|| value.as_str()?.parse::<u64>().ok())
+                            })
+                            .unwrap_or(0)
+                    };
+                    Some((
+                        dimension("width").saturating_mul(dimension("height")),
+                        url.to_owned(),
+                    ))
                 })
-                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| right.0.cmp(&left.0));
+            let mut seen = HashSet::new();
+            let urls = candidates
+                .into_iter()
+                .map(|(_, url)| {
+                    if url.starts_with("//") {
+                        format!("https:{url}")
+                    } else {
+                        url
+                    }
+                })
+                .filter(|url| seen.insert(url.clone()))
+                .collect::<Vec<_>>();
+            (!urls.is_empty()).then_some(urls)
         })
         .collect()
+}
+
+fn picture_urls(json: Option<String>) -> Vec<String> {
+    picture_url_candidates(json)
+        .into_iter()
+        .filter_map(|urls| urls.into_iter().next())
+        .collect()
+}
+
+fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.get(4..12).is_some_and(|value| {
+        value.starts_with(b"ftyp") && (&value[4..8] == b"avif" || &value[4..8] == b"avis")
+    }) {
+        Some("avif")
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+pub async fn load_archived_image(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    id: i64,
+    picture_index: usize,
+) -> Result<String, String> {
+    let auth = login.qzone_auth().await?;
+    let image_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
+        .join("images")
+        .join(&auth.uin);
+    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
+    let file_stem = format!("{id}-{picture_index}");
+    for extension in ["jpg", "png", "gif", "webp", "avif", "bmp"] {
+        let path = image_dir.join(format!("{file_stem}.{extension}"));
+        if path.metadata().is_ok_and(|metadata| metadata.len() > 32) {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+    }
+
+    let pictures_json = {
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT pictures_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                params![id, auth.uin],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条图片归档".into(),
+                _ => format!("读取图片归档失败：{error}"),
+            })?
+    };
+    let candidates = picture_url_candidates(pictures_json)
+        .into_iter()
+        .nth(picture_index)
+        .ok_or("该图片没有保存可用的 QQ 地址")?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
+    let mut last_error = String::new();
+    for url in candidates {
+        for (with_cookie, with_referer) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut request = client
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, &auth.user_agent)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+                )
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
+            if with_cookie {
+                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
+            }
+            if with_referer {
+                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > 50 * 1024 * 1024)
+                    {
+                        last_error = "图片超过 50 MB 安全限制".into();
+                        continue;
+                    }
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            let Some(extension) = archived_image_extension(&bytes) else {
+                                last_error = "QQ 返回了非图片内容".into();
+                                continue;
+                            };
+                            let path = image_dir.join(format!("{file_stem}.{extension}"));
+                            let temporary = image_dir.join(format!("{file_stem}.part"));
+                            fs::write(&temporary, &bytes)
+                                .map_err(|error| format!("写入图片归档失败：{error}"))?;
+                            fs::rename(&temporary, &path)
+                                .map_err(|error| format!("保存图片归档失败：{error}"))?;
+                            return Ok(path.to_string_lossy().into_owned());
+                        }
+                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
+                    }
+                }
+                Ok(response) => last_error = format!("HTTP {}", response.status()),
+                Err(error) => last_error = format!("请求图片失败：{error}"),
+            }
+        }
+    }
+    Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
 }
 
 fn video_urls(json: Option<String>) -> Vec<String> {
@@ -1712,6 +1872,7 @@ pub async fn list_archived_media(
                 key: format!("{id}-photo-{index}"),
                 dynamic_id: id,
                 media_type: "photo",
+                picture_index: Some(index),
                 url,
                 cover_url: None,
                 published_at,
@@ -1726,6 +1887,7 @@ pub async fn list_archived_media(
                 key: format!("{id}-video"),
                 dynamic_id: id,
                 media_type: "video",
+                picture_index: None,
                 url: url.clone(),
                 cover_url: video_cover_url(video_json),
                 published_at,
@@ -2319,6 +2481,14 @@ pub async fn delete_all_app_data(
         .join("videos");
     if videos.exists() {
         fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?;
+    }
+    let images = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
+        .join("images");
+    if images.exists() {
+        fs::remove_dir_all(images).map_err(|error| format!("删除图片归档失败：{error}"))?;
     }
     if let Ok(mut progress) = state.progress.lock() {
         *progress = ArchiveProgress::default();

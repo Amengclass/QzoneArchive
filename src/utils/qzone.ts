@@ -31,7 +31,7 @@ export interface LikeUser { uin?: string; nickname?: string; }
 export interface ArchiveReply { uin?: string; nickname?: string; content: string; createdAt: number; }
 export interface ArchiveComment { uin?: string; nickname?: string; content: string; createdAt: number; replies: ArchiveReply[]; }
 export type ArchiveCategory = "self" | "other" | "guestbook";
-export interface ArchiveMediaItem { key: string; dynamicId: number; mediaType: "photo" | "video"; url: string; coverUrl?: string; publishedAt: number; authorUin?: string; authorName?: string; content?: string; }
+export interface ArchiveMediaItem { key: string; dynamicId: number; mediaType: "photo" | "video"; pictureIndex?: number; url: string; coverUrl?: string; publishedAt: number; authorUin?: string; authorName?: string; content?: string; }
 export interface ArchiveMediaPage { items: ArchiveMediaItem[]; total: number; years: number[]; }
 export const startFeedArchive = (intervalMs: number) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs });
 export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_progress");
@@ -43,6 +43,7 @@ export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invo
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
 export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke<number>("count_archived_feeds", { category });
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
+export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
 export interface ArchiveOverview { dynamics: number; pictures: number; comments: number; likes: number; databaseBytes: number; }
 export const getArchiveOverview = () => invoke<ArchiveOverview>("get_archive_overview");

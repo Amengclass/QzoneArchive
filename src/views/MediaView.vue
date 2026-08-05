@@ -5,7 +5,7 @@ import { fetch } from "@tauri-apps/plugin-http";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import Select from "primevue/select";
-import { getArchivedFeed, listArchivedMedia, loadArchivedVideo, type ArchiveItem, type ArchiveMediaItem } from "../utils/qzone";
+import { getArchivedFeed, listArchivedMedia, loadArchivedImage, loadArchivedVideo, type ArchiveItem, type ArchiveMediaItem } from "../utils/qzone";
 import { parseQzoneText } from "../utils/qzoneText";
 
 const PAGE_SIZE = 60;
@@ -20,6 +20,7 @@ const detailLoading = ref(false);
 const detail = ref<ArchiveItem>();
 const imageSources = reactive<Record<string, string>>({});
 const imageLoading = reactive<Record<string, boolean>>({});
+const imageErrors = reactive<Record<string, string>>({});
 const videoSource = ref("");
 const videoLoading = ref(false);
 const videoError = ref("");
@@ -53,22 +54,29 @@ function observeImages() {
       if (!entry.isIntersecting) continue;
       const element = entry.target as HTMLElement;
       const url = element.dataset.mediaImage;
-      if (url) void loadImage(url);
+      const dynamicId = Number(element.dataset.dynamicId);
+      const pictureIndex = Number(element.dataset.pictureIndex);
+      if (url) void loadImage(url, Number.isFinite(dynamicId) ? dynamicId : undefined, Number.isFinite(pictureIndex) ? pictureIndex : undefined);
       imageObserver?.unobserve(element);
     }
   }, { rootMargin: "360px 0px" });
   document.querySelectorAll<HTMLElement>(".media-page [data-media-image]").forEach((element) => imageObserver?.observe(element));
 }
 
-async function loadImage(url: string) {
+async function loadImage(url: string, dynamicId?: number, pictureIndex?: number) {
   if (!url || imageSources[url] || imageLoading[url]) return;
   imageLoading[url] = true;
+  delete imageErrors[url];
   try {
-    const response = await fetch(url, { method: "GET", headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" } });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const bytes = await response.arrayBuffer();
-    imageSources[url] = URL.createObjectURL(new Blob([bytes], { type: response.headers.get("content-type") || "image/jpeg" }));
-  } catch (reason) { console.error("媒体图片加载失败", reason); }
+    if (dynamicId !== undefined && pictureIndex !== undefined) {
+      imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+    } else {
+      const response = await fetch(url, { method: "GET", headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" } });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const bytes = await response.arrayBuffer();
+      imageSources[url] = URL.createObjectURL(new Blob([bytes], { type: response.headers.get("content-type") || "image/jpeg" }));
+    }
+  } catch (reason) { imageErrors[url] = String(reason); console.error("媒体图片加载失败", reason); }
   finally { imageLoading[url] = false; }
 }
 
@@ -79,7 +87,7 @@ async function openOriginal(item: ArchiveMediaItem) {
   releaseVideo();
   try {
     detail.value = await getArchivedFeed(item.dynamicId);
-    await Promise.all(detail.value.pictureUrls.map(loadImage));
+    await Promise.all(detail.value.pictureUrls.map((url, index) => loadImage(url, detail.value?.id, index)));
     if (detail.value.videoCoverUrl) await loadImage(detail.value.videoCoverUrl);
   } catch (reason) { error.value = `读取原始动态失败：${String(reason)}`; detailVisible.value = false; }
   finally { detailLoading.value = false; }
@@ -124,9 +132,9 @@ onBeforeUnmount(() => {
     <p v-if="error" class="archive-error"><i class="pi pi-exclamation-circle" />{{ error }}</p>
     <section v-if="media.length" class="media-waterfall" aria-label="归档媒体">
       <button v-for="item in media" :key="item.key" type="button" class="media-tile" @click="openOriginal(item)">
-        <div class="media-tile-visual" :data-media-image="item.mediaType === 'photo' ? item.url : item.coverUrl">
+        <div class="media-tile-visual" :data-media-image="item.mediaType === 'photo' ? item.url : item.coverUrl" :data-dynamic-id="item.mediaType === 'photo' ? item.dynamicId : undefined" :data-picture-index="item.mediaType === 'photo' ? item.pictureIndex : undefined">
           <img v-if="imageSources[item.mediaType === 'photo' ? item.url : (item.coverUrl || '')]" :src="imageSources[item.mediaType === 'photo' ? item.url : (item.coverUrl || '')]" loading="lazy" />
-          <span v-else class="media-placeholder"><i :class="item.mediaType === 'video' ? 'pi pi-video' : 'pi pi-image'" />{{ imageLoading[item.mediaType === 'photo' ? item.url : (item.coverUrl || '')] ? '加载中' : item.mediaType === 'video' ? '视频' : '照片' }}</span>
+          <span v-else class="media-placeholder"><i :class="item.mediaType === 'video' ? 'pi pi-video' : 'pi pi-image'" /><span v-if="item.mediaType === 'photo' && imageErrors[item.url]" class="media-image-retry" :title="imageErrors[item.url]" role="button" tabindex="0" @click.stop="loadImage(item.url, item.dynamicId, item.pictureIndex)" @keydown.enter.stop="loadImage(item.url, item.dynamicId, item.pictureIndex)">加载失败，重试</span><template v-else>{{ imageLoading[item.mediaType === 'photo' ? item.url : (item.coverUrl || '')] ? '正在尝试多个图片地址' : item.mediaType === 'video' ? '视频' : '照片' }}</template></span>
           <span v-if="item.mediaType === 'video'" class="media-video-mark"><i class="pi pi-play" /></span>
           <time>{{ new Date(item.publishedAt * 1000).getFullYear() }}</time>
         </div>
@@ -142,7 +150,7 @@ onBeforeUnmount(() => {
     <article v-else-if="detail" class="media-original">
       <header><span class="archive-avatar"><img v-if="detail.authorUin" :src="avatarUrl(detail.authorUin)" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span><div><strong>{{ detail.authorName || "QQ 用户" }}</strong><small><span v-if="detail.authorUin">QQ {{ detail.authorUin }} · </span>{{ formatTime(detail.publishedAt) }}</small></div></header>
       <p v-if="detail.content" class="media-original-content"><span v-for="(part,index) in parseQzoneText(detail.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }">{{ part.value }}</span></p>
-      <div v-if="detail.pictureUrls.length" class="media-original-pictures"><img v-for="url in detail.pictureUrls" :key="url" :src="imageSources[url]" /></div>
+      <div v-if="detail.pictureUrls.length" class="media-original-pictures"><template v-for="(url, index) in detail.pictureUrls" :key="url"><img v-if="imageSources[url]" :src="imageSources[url]" /><button v-else type="button" class="media-detail-image-placeholder" :title="imageErrors[url]" @click="loadImage(url, detail.id, index)"><i class="pi pi-image" />{{ imageErrors[url] ? "加载失败，重试" : "图片加载中" }}</button></template></div>
       <video v-if="videoSource" class="archive-video" :src="videoSource" controls autoplay playsinline />
       <button v-else-if="detail.videoUrl" type="button" class="archive-video-cover media-detail-video" @click="playVideo"><img v-if="detail.videoCoverUrl && imageSources[detail.videoCoverUrl]" :src="imageSources[detail.videoCoverUrl]" /><span class="video-cover-shade"><span class="video-play-button"><i :class="videoLoading ? 'pi pi-spin pi-spinner' : 'pi pi-play'" /></span><strong>{{ videoLoading ? "正在加载视频…" : "点击播放视频" }}</strong><small>{{ videoError || "视频将在点击后下载" }}</small></span></button>
       <div class="archive-assets"><span><i class="pi pi-heart" />{{ detail.likeCount }} 个赞</span><span><i class="pi pi-comment" />{{ detail.commentCount }} 条评论</span></div>
