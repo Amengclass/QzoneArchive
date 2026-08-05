@@ -23,6 +23,7 @@ pub struct ArchiveProgress {
     pages: u32,
     fetched: u64,
     saved: u64,
+    skipped: u32,
     message: String,
     retry_at: Option<i64>,
 }
@@ -34,6 +35,7 @@ impl Default for ArchiveProgress {
             pages: 0,
             fetched: 0,
             saved: 0,
+            skipped: 0,
             message: "尚未开始归档".into(),
             retry_at: None,
         }
@@ -43,6 +45,7 @@ impl Default for ArchiveProgress {
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
+    image_downloads: tokio::sync::Semaphore,
 }
 
 impl ArchiveState {
@@ -50,6 +53,7 @@ impl ArchiveState {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
+            image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
 }
@@ -127,6 +131,7 @@ pub struct ArchiveMediaItem {
     key: String,
     dynamic_id: i64,
     media_type: &'static str,
+    picture_index: Option<usize>,
     url: String,
     cover_url: Option<String>,
     published_at: i64,
@@ -167,6 +172,50 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSkipItem {
+    id: i64,
+    page_number: u32,
+    cursor_offset: i64,
+    offset_advance: i64,
+    base_time: i64,
+    error: String,
+    skipped_at: i64,
+    retry_count: u32,
+    last_retry_at: Option<i64>,
+    resolved_at: Option<i64>,
+    recovered_records: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSkipRetryResult {
+    success: bool,
+    message: String,
+    recovered_records: u64,
+}
+
+fn stable_feed_hash(value: &Value) -> u64 {
+    // FNV-1a keeps fallback keys deterministic without adding a hashing dependency.
+    value
+        .to_string()
+        .bytes()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn archive_page_delay_ms(interval_ms: u64) -> u64 {
+    let interval_ms = interval_ms.clamp(2_000, 30_000);
+    let jitter_range = (interval_ms / 4).max(1);
+    let subsecond_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    interval_ms + subsecond_nanos % (jitter_range + 1)
 }
 
 fn database_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -240,6 +289,23 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            owner_uin TEXT PRIMARY KEY,
            window_started_at INTEGER NOT NULL,
            requested_pages INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS archive_skips (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           owner_uin TEXT NOT NULL,
+           cursor TEXT NOT NULL,
+           resume_cursor TEXT NOT NULL,
+           page_number INTEGER NOT NULL,
+           cursor_offset INTEGER NOT NULL,
+           offset_advance INTEGER NOT NULL,
+           base_time INTEGER NOT NULL,
+           error TEXT NOT NULL,
+           skipped_at INTEGER NOT NULL,
+           retry_count INTEGER NOT NULL DEFAULT 0,
+           last_retry_at INTEGER,
+           resolved_at INTEGER,
+           recovered_records INTEGER NOT NULL DEFAULT 0,
+           UNIQUE(owner_uin, cursor_offset, base_time)
          );",
         )
         .map_err(|error| format!("初始化归档数据库失败：{error}"))?;
@@ -375,7 +441,13 @@ fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
                 )
             })
         })
-        .ok_or("动态记录缺少可用于去重的 feedskey 和 cell_id")?;
+        .unwrap_or_else(|| {
+            format!(
+                "fallback:{event_type}:{event_time}:{}:{:016x}",
+                actor_uin.as_deref().unwrap_or("unknown"),
+                stable_feed_hash(feed)
+            )
+        });
     let pictures = feed.pointer("/original/cell_pic");
     let picture_count = pictures
         .and_then(|value| value.pointer("/picdata/pic"))
@@ -408,19 +480,14 @@ fn parse_feed(feed: &Value) -> Result<ParsedFeed, String> {
     })
 }
 
-fn save_page(
-    app: &tauri::AppHandle,
+fn save_feed_rows(
+    transaction: &rusqlite::Transaction<'_>,
     owner_uin: &str,
     feeds: &[Value],
-    next_cursor: Option<&str>,
 ) -> Result<u64, String> {
-    let mut connection = open_database(app)?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| format!("无法开始数据库事务：{error}"))?;
     let mut saved = 0;
     for feed in feeds {
-        save_original_dynamic(&transaction, owner_uin, feed)?;
+        save_original_dynamic(transaction, owner_uin, feed)?;
         let feed = parse_feed(feed)?;
         let changed = transaction.execute(
             "INSERT INTO archive_feeds
@@ -443,14 +510,38 @@ fn save_page(
         ).map_err(|error| format!("保存动态失败：{error}"))?;
         saved += changed as u64;
     }
+    Ok(saved)
+}
+
+fn save_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    feeds: &[Value],
+    next_cursor: Option<&str>,
+    reset_checkpoint_stats: bool,
+) -> Result<u64, String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("无法开始数据库事务：{error}"))?;
+    let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
     if let Some(cursor) = next_cursor {
-        transaction.execute(
-            "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
-             ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
-              pages=archive_checkpoints.pages+1,fetched=archive_checkpoints.fetched+excluded.fetched,
-              saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at",
-            params![owner_uin, cursor, feeds.len() as u64, saved, now()],
-        ).map_err(|error| format!("保存归档续传位置失败：{error}"))?;
+        if reset_checkpoint_stats {
+            transaction.execute(
+                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
+                 ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
+                  pages=1,fetched=excluded.fetched,saved=excluded.saved,updated_at=excluded.updated_at",
+                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+            ).map_err(|error| format!("重置归档续传位置失败：{error}"))?;
+        } else {
+            transaction.execute(
+                "INSERT INTO archive_checkpoints(owner_uin,attach_info,pages,fetched,saved,updated_at) VALUES (?1,?2,1,?3,?4,?5)
+                 ON CONFLICT(owner_uin) DO UPDATE SET attach_info=excluded.attach_info,
+                  pages=archive_checkpoints.pages+1,fetched=archive_checkpoints.fetched+excluded.fetched,
+                  saved=archive_checkpoints.saved+excluded.saved,updated_at=excluded.updated_at",
+                params![owner_uin, cursor, feeds.len() as u64, saved, now()],
+            ).map_err(|error| format!("保存归档续传位置失败：{error}"))?;
+        }
     } else {
         transaction
             .execute(
@@ -465,25 +556,231 @@ fn save_page(
     Ok(saved)
 }
 
+fn save_retried_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    feeds: &[Value],
+) -> Result<u64, String> {
+    let mut connection = open_database(app)?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("无法开始重试事务：{error}"))?;
+    let saved = save_feed_rows(&transaction, owner_uin, feeds)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("提交重试事务失败：{error}"))?;
+    Ok(saved)
+}
+
 struct ArchiveCheckpoint {
     cursor: String,
     pages: u32,
     fetched: u64,
     saved: u64,
+    updated_at: i64,
 }
 
 const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
 const ARCHIVE_RATE_PAGE_LIMIT: i64 = 300;
+const ARCHIVE_CURSOR_MAX_AGE_SECONDS: i64 = 10 * 60;
+const ARCHIVE_SKIP_MAX_OFFSET_ADVANCE: i64 = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FeedCursorDetails {
+    offset: i64,
+    base_time: i64,
+    load_count: i64,
+}
+
+fn parse_query_pairs(value: &str) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(value.as_bytes())
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+fn serialize_query_pairs(pairs: &[(String, String)]) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (key, value) in pairs {
+        serializer.append_pair(key, value);
+    }
+    serializer.finish()
+}
+
+fn pair_value<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(candidate, _)| candidate == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn set_pair_value(pairs: &mut [(String, String)], key: &str, value: String) -> Result<(), String> {
+    let pair = pairs
+        .iter_mut()
+        .find(|(candidate, _)| candidate == key)
+        .ok_or_else(|| format!("分页游标缺少 {key}"))?;
+    pair.1 = value;
+    Ok(())
+}
+
+fn set_or_append_pair_value(pairs: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some(pair) = pairs.iter_mut().find(|(candidate, _)| candidate == key) {
+        pair.1 = value;
+    } else {
+        pairs.push((key.to_owned(), value));
+    }
+}
+
+fn parse_feed_cursor(cursor: &str) -> Result<FeedCursorDetails, String> {
+    let outer = parse_query_pairs(cursor);
+    let attach = pair_value(&outer, "att").ok_or("分页游标缺少 att")?;
+    let attach = parse_query_pairs(attach);
+    let backend = pair_value(&attach, "back_server_info").ok_or("分页游标缺少 back_server_info")?;
+    let backend = parse_query_pairs(backend);
+    let parse_number = |pairs: &[(String, String)], key: &str| {
+        pair_value(pairs, key)
+            .ok_or_else(|| format!("分页游标缺少 {key}"))?
+            .parse::<i64>()
+            .map_err(|_| format!("分页游标中的 {key} 不是有效数字"))
+    };
+    let load_count = pair_value(&outer, "loadcount")
+        .or_else(|| pair_value(&attach, "loadcount"))
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| "分页游标中的 loadcount 不是有效数字".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(FeedCursorDetails {
+        offset: parse_number(&backend, "offset")?,
+        base_time: parse_number(&backend, "basetime")?,
+        load_count,
+    })
+}
+
+fn advance_feed_cursor(cursor: &str, offset_advance: i64) -> Result<String, String> {
+    if offset_advance <= 0 {
+        return Err("跳过偏移量必须大于 0".into());
+    }
+    let details = parse_feed_cursor(cursor)?;
+    let mut outer = parse_query_pairs(cursor);
+    let mut attach = parse_query_pairs(pair_value(&outer, "att").ok_or("分页游标缺少 att")?);
+    let mut backend = parse_query_pairs(
+        pair_value(&attach, "back_server_info").ok_or("分页游标缺少 back_server_info")?,
+    );
+    let load_count_in_outer = pair_value(&outer, "loadcount").is_some();
+    set_pair_value(
+        &mut backend,
+        "offset",
+        details.offset.saturating_add(offset_advance).to_string(),
+    )?;
+    set_pair_value(
+        &mut attach,
+        "back_server_info",
+        serialize_query_pairs(&backend),
+    )?;
+    if !load_count_in_outer {
+        set_or_append_pair_value(
+            &mut attach,
+            "loadcount",
+            details.load_count.saturating_add(1).to_string(),
+        );
+    }
+    set_pair_value(&mut outer, "att", serialize_query_pairs(&attach))?;
+    if load_count_in_outer {
+        set_pair_value(
+            &mut outer,
+            "loadcount",
+            details.load_count.saturating_add(1).to_string(),
+        )?;
+    }
+    Ok(serialize_query_pairs(&outer))
+}
+
+fn unresolved_skip_count(app: &tauri::AppHandle, owner_uin: &str) -> Result<u32, String> {
+    let connection = open_database(app)?;
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM archive_skips WHERE owner_uin=?1 AND resolved_at IS NULL",
+            params![owner_uin],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("读取异常跳过数量失败：{error}"))
+}
+
+fn known_skip_advance(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    details: FeedCursorDetails,
+) -> Result<Option<(i64, String)>, String> {
+    let connection = open_database(app)?;
+    match connection.query_row(
+        "SELECT offset_advance,error FROM archive_skips
+         WHERE owner_uin=?1 AND cursor_offset=?2 AND base_time=?3 AND resolved_at IS NULL",
+        params![owner_uin, details.offset, details.base_time],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!("读取已知异常位置失败：{error}")),
+    }
+}
+
+struct SkipRecord<'a> {
+    cursor: &'a str,
+    resume_cursor: &'a str,
+    page_number: u32,
+    details: FeedCursorDetails,
+    offset_advance: i64,
+    error: &'a str,
+}
+
+fn record_archive_skip(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    record: SkipRecord<'_>,
+) -> Result<(), String> {
+    let connection = open_database(app)?;
+    connection.execute(
+        "INSERT INTO archive_skips
+         (owner_uin,cursor,resume_cursor,page_number,cursor_offset,offset_advance,base_time,error,skipped_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(owner_uin,cursor_offset,base_time) DO UPDATE SET
+          cursor=excluded.cursor,resume_cursor=excluded.resume_cursor,page_number=excluded.page_number,
+          offset_advance=excluded.offset_advance,error=excluded.error,skipped_at=excluded.skipped_at,
+          resolved_at=NULL,recovered_records=0",
+        params![
+            owner_uin,
+            record.cursor,
+            record.resume_cursor,
+            record.page_number,
+            record.details.offset,
+            record.offset_advance,
+            record.details.base_time,
+            concise_archive_error(record.error),
+            now(),
+        ],
+    ).map_err(|error| format!("保存异常跳过记录失败：{error}"))?;
+    Ok(())
+}
+
+fn checkpoint_is_stale(checkpoint: &ArchiveCheckpoint, current: i64) -> bool {
+    current.saturating_sub(checkpoint.updated_at) >= ARCHIVE_CURSOR_MAX_AGE_SECONDS
+}
 
 fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
     let connection = open_database(app)?;
     let current = now();
     let state = connection.query_row(
         "SELECT window_started_at,requested_pages FROM archive_rate_limits WHERE owner_uin=?1",
-        params![owner_uin], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        params![owner_uin],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
     );
     match state {
-        Ok((started_at, pages)) if current - started_at < ARCHIVE_RATE_WINDOW_SECONDS && pages >= ARCHIVE_RATE_PAGE_LIMIT => {
+        Ok((started_at, pages))
+            if current - started_at < ARCHIVE_RATE_WINDOW_SECONDS
+                && pages >= ARCHIVE_RATE_PAGE_LIMIT =>
+        {
             Ok(Some(started_at + ARCHIVE_RATE_WINDOW_SECONDS))
         }
         Ok((started_at, _)) if current - started_at >= ARCHIVE_RATE_WINDOW_SECONDS => {
@@ -517,7 +814,7 @@ fn load_checkpoint(
 ) -> Result<Option<ArchiveCheckpoint>, String> {
     let connection = open_database(app)?;
     match connection.query_row(
-        "SELECT attach_info,pages,fetched,saved FROM archive_checkpoints WHERE owner_uin=?1",
+        "SELECT attach_info,pages,fetched,saved,updated_at FROM archive_checkpoints WHERE owner_uin=?1",
         params![owner_uin],
         |row| {
             Ok(ArchiveCheckpoint {
@@ -525,6 +822,7 @@ fn load_checkpoint(
                 pages: row.get(1)?,
                 fetched: row.get(2)?,
                 saved: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         },
     ) {
@@ -601,7 +899,7 @@ fn save_original_dynamic(
     Ok(())
 }
 
-fn picture_urls(json: Option<String>) -> Vec<String> {
+fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
     let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
         return vec![];
     };
@@ -611,26 +909,243 @@ fn picture_urls(json: Option<String>) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|pic| {
-            pic.pointer("/photourl/0/url")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    pic.get("photourl")?
-                        .as_object()?
-                        .values()
-                        .find_map(|item| item.get("url")?.as_str())
+            let photo_urls = pic.get("photourl")?;
+            let values = match photo_urls {
+                Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                Value::Object(items) => items.values().collect::<Vec<_>>(),
+                _ => vec![],
+            };
+            let candidates = values
+                .into_iter()
+                .filter_map(|item| {
+                    let url = item.get("url")?.as_str()?.trim();
+                    if url.is_empty() {
+                        return None;
+                    }
+                    Some(url.to_owned())
                 })
-                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut candidates = candidates;
+            if let Some(url) = pic
+                .pointer("/busi_param/-1")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            {
+                candidates.push(url.to_owned());
+            }
+            let mut seen = HashSet::new();
+            let urls = candidates
+                .into_iter()
+                .map(|url| {
+                    if url.starts_with("//") {
+                        format!("https:{url}")
+                    } else {
+                        url
+                    }
+                })
+                .filter(|url| seen.insert(url.clone()))
+                .collect::<Vec<_>>();
+            (!urls.is_empty()).then_some(urls)
         })
         .collect()
 }
 
+fn picture_urls(json: Option<String>) -> Vec<String> {
+    picture_url_candidates(json)
+        .into_iter()
+        .filter_map(|urls| urls.into_iter().next())
+        .collect()
+}
+
+fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("bmp")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.get(4..12).is_some_and(|value| {
+        value.starts_with(b"ftyp") && (&value[4..8] == b"avif" || &value[4..8] == b"avis")
+    }) {
+        Some("avif")
+    } else {
+        None
+    }
+}
+
+fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
+    bytes.get(6..10).is_some_and(|size| {
+        let width = u16::from_le_bytes([size[0], size[1]]);
+        let height = u16::from_le_bytes([size[2], size[3]]);
+        (bytes.len() == 2_038 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (bytes.len() == 2_687
+                && bytes.starts_with(b"GIF89a")
+                && width == 340
+                && height == 320)
+            || (bytes.len() == 1_643 && bytes.starts_with(b"GIF87a") && width == 99 && height == 99)
+            || (bytes.len() == 1_547 && bytes.starts_with(b"GIF87a") && width == 98 && height == 98)
+    })
+}
+
+fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Option<PathBuf> {
+    ["jpg", "png", "gif", "webp", "avif", "bmp"]
+        .into_iter()
+        .map(|extension| image_dir.join(format!("{file_stem}.{extension}")))
+        .find_map(|path| {
+            if !path.metadata().is_ok_and(|metadata| metadata.len() > 32) {
+                return None;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+                && fs::read(&path).is_ok_and(|bytes| is_qq_missing_image_placeholder(&bytes))
+            {
+                let _ = fs::remove_file(&path);
+                return None;
+            }
+            Some(path)
+        })
+}
+
+#[tauri::command]
+pub async fn load_archived_image(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    id: i64,
+    picture_index: usize,
+) -> Result<String, String> {
+    let auth = login.qzone_auth().await?;
+    let image_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
+        .join("images")
+        .join(&auth.uin);
+    fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
+    let file_stem = format!("{id}-{picture_index}");
+    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+
+    let pictures_json = {
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT pictures_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                params![id, auth.uin],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条图片归档".into(),
+                _ => format!("读取图片归档失败：{error}"),
+            })?
+    };
+    let candidates = picture_url_candidates(pictures_json)
+        .into_iter()
+        .nth(picture_index)
+        .ok_or("该图片没有保存可用的 QQ 地址")?;
+    let _permit = state
+        .image_downloads
+        .acquire()
+        .await
+        .map_err(|_| "图片下载队列已关闭")?;
+    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
+    let mut last_error = String::new();
+    for url in candidates {
+        for (with_cookie, with_referer) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut request = client
+                .get(&url)
+                .header(reqwest::header::USER_AGENT, &auth.user_agent)
+                .header(
+                    reqwest::header::ACCEPT,
+                    "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+                )
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
+            if with_cookie {
+                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
+            }
+            if with_referer {
+                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    if response
+                        .content_length()
+                        .is_some_and(|length| length > 50 * 1024 * 1024)
+                    {
+                        last_error = "图片超过 50 MB 安全限制".into();
+                        continue;
+                    }
+                    match response.bytes().await {
+                        Ok(bytes) => {
+                            let Some(extension) = archived_image_extension(&bytes) else {
+                                last_error = "QQ 返回了非图片内容".into();
+                                continue;
+                            };
+                            if is_qq_missing_image_placeholder(&bytes) {
+                                last_error = "QQ 返回了图片不存在占位图".into();
+                                continue;
+                            }
+                            let path = image_dir.join(format!("{file_stem}.{extension}"));
+                            let nonce = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos();
+                            let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
+                            fs::write(&temporary, &bytes)
+                                .map_err(|error| format!("写入图片归档失败：{error}"))?;
+                            if let Err(error) = fs::rename(&temporary, &path) {
+                                if !path.exists() {
+                                    let _ = fs::remove_file(&temporary);
+                                    return Err(format!("保存图片归档失败：{error}"));
+                                }
+                                let _ = fs::remove_file(&temporary);
+                            }
+                            return Ok(path.to_string_lossy().into_owned());
+                        }
+                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
+                    }
+                }
+                Ok(response) => last_error = format!("HTTP {}", response.status()),
+                Err(error) => last_error = format!("请求图片失败：{error}"),
+            }
+        }
+    }
+    Err(format!("所有 QQ 图片地址均加载失败：{last_error}"))
+}
+
 fn video_urls(json: Option<String>) -> Vec<String> {
-    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else { return vec![] };
+    let Some(value) = json.and_then(|text| serde_json::from_str::<Value>(&text).ok()) else {
+        return vec![];
+    };
     let mut urls = Vec::new();
-    if let Some(url) = value.get("videourl").and_then(Value::as_str) { urls.push(url.to_owned()); }
+    if let Some(url) = value.get("videourl").and_then(Value::as_str) {
+        urls.push(url.to_owned());
+    }
     if let Some(items) = value.get("videourls").and_then(Value::as_object) {
-        for url in items.values().filter_map(|item| item.get("url").and_then(Value::as_str)) {
-            if !urls.iter().any(|saved| saved == url) { urls.push(url.to_owned()); }
+        for url in items
+            .values()
+            .filter_map(|item| item.get("url").and_then(Value::as_str))
+        {
+            if !urls.iter().any(|saved| saved == url) {
+                urls.push(url.to_owned());
+            }
         }
     }
     urls
@@ -658,52 +1173,91 @@ pub async fn load_archived_video(
     id: i64,
 ) -> Result<String, String> {
     let auth = login.qzone_auth().await?;
-    let cache_dir = app.path().app_cache_dir().map_err(|error| format!("无法获取视频缓存目录：{error}"))?.join("videos");
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取视频缓存目录：{error}"))?
+        .join("videos");
     fs::create_dir_all(&cache_dir).map_err(|error| format!("无法创建视频缓存目录：{error}"))?;
     let cache_path = cache_dir.join(format!("{}-{id}.mp4", auth.uin));
-    if cache_path.metadata().is_ok_and(|metadata| metadata.len() > 1024) {
+    if cache_path
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() > 1024)
+    {
         return Ok(cache_path.to_string_lossy().into_owned());
     }
     let video_json = {
         let connection = open_database(&app)?;
-        connection.query_row(
-            "SELECT video_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
-            params![id, auth.uin],
-            |row| row.get::<_, Option<String>>(0),
-        ).map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条视频归档".into(),
-            _ => format!("读取视频归档失败：{error}"),
-        })?
+        connection
+            .query_row(
+                "SELECT video_json FROM archive_dynamics WHERE id=?1 AND owner_uin=?2",
+                params![id, auth.uin],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => "当前账号中不存在这条视频归档".into(),
+                _ => format!("读取视频归档失败：{error}"),
+            })?
     };
     let candidates = video_urls(video_json);
-    if candidates.is_empty() { return Err("该归档没有可用的视频地址".into()); }
+    if candidates.is_empty() {
+        return Err("该归档没有可用的视频地址".into());
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
         .connect_timeout(std::time::Duration::from_secs(20))
         .timeout(std::time::Duration::from_secs(180))
-        .build().map_err(|error| format!("创建视频请求客户端失败：{error}"))?;
+        .build()
+        .map_err(|error| format!("创建视频请求客户端失败：{error}"))?;
     let mut last_error = String::new();
     let mut rejected = false;
     for url in candidates {
-        for (with_cookie, with_referer) in [(true, true), (true, false), (false, true), (false, false)] {
-            let mut request = client.get(&url)
+        for (with_cookie, with_referer) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let mut request = client
+                .get(&url)
                 .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                .header(reqwest::header::ACCEPT, "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5")
+                .header(
+                    reqwest::header::ACCEPT,
+                    "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
+                )
                 .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
-            if with_cookie { request = request.header(reqwest::header::COOKIE, &auth.cookie_header); }
-            if with_referer { request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/"); }
+            if with_cookie {
+                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
+            }
+            if with_referer {
+                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
+            }
             match request.send().await {
                 Ok(response) if response.status().is_success() => {
-                    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+                    let content_type = response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
                     match response.bytes().await {
                         Ok(bytes) => {
-                            let is_mp4 = bytes.get(4..12).is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
-                            if content_type.starts_with("video/") || content_type.contains("octet-stream") || is_mp4 {
-                                fs::write(&cache_path, &bytes).map_err(|error| format!("写入视频缓存失败：{error}"))?;
+                            let is_mp4 = bytes
+                                .get(4..12)
+                                .is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
+                            if content_type.starts_with("video/")
+                                || content_type.contains("octet-stream")
+                                || is_mp4
+                            {
+                                fs::write(&cache_path, &bytes)
+                                    .map_err(|error| format!("写入视频缓存失败：{error}"))?;
                                 return Ok(cache_path.to_string_lossy().into_owned());
                             }
-                            last_error = format!("QQ 返回了非视频内容（{}）", if content_type.is_empty() { "未知类型" } else { &content_type });
+                            last_error = format!(
+                                "QQ 返回了非视频内容（{}）",
+                                if content_type.is_empty() {
+                                    "未知类型"
+                                } else {
+                                    &content_type
+                                }
+                            );
                         }
                         Err(error) => last_error = format!("读取视频数据失败：{error}"),
                     }
@@ -716,14 +1270,121 @@ pub async fn load_archived_video(
             }
         }
     }
-    if rejected { Err("QQ 拒绝了视频请求（HTTP 403），该归档的视频临时签名可能已经过期，请重新归档以更新视频地址".into()) }
-    else { Err(format!("所有视频地址均加载失败：{last_error}")) }
+    if rejected {
+        Err("QQ 拒绝了视频请求（HTTP 403），该归档的视频临时签名可能已经过期，请重新归档以更新视频地址".into())
+    } else {
+        Err(format!("所有视频地址均加载失败：{last_error}"))
+    }
 }
 
 fn set_progress(state: &ArchiveState, update: impl FnOnce(&mut ArchiveProgress)) {
     if let Ok(mut progress) = state.progress.lock() {
         update(&mut progress);
     }
+}
+
+fn concise_archive_error(error: &str) -> String {
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let summary = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{summary}…")
+    } else {
+        summary
+    }
+}
+
+async fn fetch_after_skipped_cursor(
+    app: &tauri::AppHandle,
+    login: &QLoginState,
+    archive: &ArchiveState,
+    owner_uin: &str,
+    cursor: &str,
+    first_advance: i64,
+    interval_ms: u64,
+) -> Result<(qzone::FeedPage, String, i64), String> {
+    let first_advance = first_advance.clamp(1, ARCHIVE_SKIP_MAX_OFFSET_ADVANCE);
+    let mut last_error = None;
+    let mut last_failed_advance = first_advance.saturating_sub(1);
+    let mut best: Option<(qzone::FeedPage, String, i64)> = None;
+    for offset_advance in skip_probe_offsets(first_advance) {
+        set_progress(archive, |progress| {
+            progress.message =
+                format!("已记录异常位置，正在尝试从偏移 +{offset_advance} 恢复归档…");
+        });
+        if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
+            return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+        }
+        let candidate = advance_feed_cursor(cursor, offset_advance)?;
+        match qzone::fetch_feeds_once(login, "2", Some(&candidate)).await {
+            Ok(page) => {
+                best = Some((page, candidate, offset_advance));
+                break;
+            }
+            Err(error) if qzone::feed_error_can_skip(&error) => {
+                last_failed_advance = offset_advance;
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                    interval_ms,
+                )))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(mut best) = best else {
+        return Err(format!(
+            "异常位置已保存到待重试列表，但向后探测至偏移 +{} 后仍无法取得下一页：{}",
+            ARCHIVE_SKIP_MAX_OFFSET_ADVANCE,
+            concise_archive_error(last_error.as_deref().unwrap_or("未知接口错误"))
+        ));
+    };
+
+    let mut low = last_failed_advance.saturating_add(1);
+    let mut high = best.2.saturating_sub(1);
+    while low <= high {
+        let offset_advance = low + (high - low) / 2;
+        set_progress(archive, |progress| {
+            progress.message =
+                format!("已找到可恢复位置，正在缩小跳过范围（偏移 +{offset_advance}）…");
+        });
+        if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
+            return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
+        }
+        let candidate = advance_feed_cursor(cursor, offset_advance)?;
+        match qzone::fetch_feeds_once(login, "2", Some(&candidate)).await {
+            Ok(page) => {
+                best = (page, candidate, offset_advance);
+                high = offset_advance.saturating_sub(1);
+            }
+            Err(error) if qzone::feed_error_can_skip(&error) => {
+                low = offset_advance.saturating_add(1);
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+            interval_ms,
+        )))
+        .await;
+    }
+    Ok(best)
+}
+
+fn skip_probe_offsets(first_advance: i64) -> Vec<i64> {
+    let first_advance = first_advance.clamp(1, ARCHIVE_SKIP_MAX_OFFSET_ADVANCE);
+    let mut offsets = vec![first_advance];
+    let mut candidate = 1_i64;
+    while candidate <= first_advance && candidate < ARCHIVE_SKIP_MAX_OFFSET_ADVANCE {
+        candidate = candidate.saturating_mul(2);
+    }
+    while candidate < ARCHIVE_SKIP_MAX_OFFSET_ADVANCE {
+        offsets.push(candidate);
+        candidate = candidate.saturating_mul(2);
+    }
+    if offsets.last().copied() != Some(ARCHIVE_SKIP_MAX_OFFSET_ADVANCE) {
+        offsets.push(ARCHIVE_SKIP_MAX_OFFSET_ADVANCE);
+    }
+    offsets
 }
 
 #[tauri::command]
@@ -733,7 +1394,7 @@ pub async fn start_feed_archive(
     archive: tauri::State<'_, ArchiveState>,
     interval_ms: u64,
 ) -> Result<ArchiveProgress, String> {
-    let interval_ms = interval_ms.clamp(500, 30_000);
+    let interval_ms = interval_ms.clamp(2_000, 30_000);
     {
         let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
         if progress.status == "running" {
@@ -744,16 +1405,31 @@ pub async fn start_feed_archive(
             pages: 0,
             fetched: 0,
             saved: 0,
+            skipped: 0,
             message: "正在准备归档…".into(),
             retry_at: None,
         };
     }
     archive.cancel.store(false, Ordering::Relaxed);
     let owner_uin = login.qzone_auth().await?.uin;
+    let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
+    set_progress(&archive, |progress| progress.skipped = saved_skip_count);
     let checkpoint = load_checkpoint(&app, &owner_uin)?;
-    let mut cursor = checkpoint.as_ref().map(|value| value.cursor.clone());
+    let stale_checkpoint = checkpoint
+        .as_ref()
+        .is_some_and(|value| checkpoint_is_stale(value, now()));
+    let mut reset_checkpoint_stats = stale_checkpoint;
+    let mut cursor = checkpoint
+        .as_ref()
+        .filter(|_| !stale_checkpoint)
+        .map(|value| value.cursor.clone());
     let mut seen_cursors = HashSet::new();
-    if let Some(checkpoint) = checkpoint.as_ref() {
+    if stale_checkpoint {
+        set_progress(&archive, |progress| {
+            progress.message =
+                "上次分页位置已超过 10 分钟，正在从第一页重新校验；已保存记录会自动去重。".into();
+        });
+    } else if let Some(checkpoint) = checkpoint.as_ref() {
         let saved_cursor = &checkpoint.cursor;
         seen_cursors.insert(saved_cursor.clone());
         set_progress(&archive, |progress| {
@@ -771,8 +1447,88 @@ pub async fn start_feed_archive(
             if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
                 return Err(format!("ARCHIVE_RATE_LIMIT:{retry_at}"));
             }
+            let mut skipped_page: Option<(String, String, FeedCursorDetails, i64, String)> = None;
             let page = if let Some(current_cursor) = cursor.as_deref() {
-                qzone::fetch_feeds(&login, "2", Some(current_cursor)).await?
+                let known_skip = match parse_feed_cursor(current_cursor) {
+                    Ok(details) => {
+                        known_skip_advance(&app, &owner_uin, details)?.map(|known| (details, known))
+                    }
+                    Err(_) => None,
+                };
+                if let Some((details, (known_advance, known_error))) = known_skip {
+                    let (page, resume_cursor, offset_advance) = fetch_after_skipped_cursor(
+                        &app,
+                        &login,
+                        &archive,
+                        &owner_uin,
+                        current_cursor,
+                        known_advance,
+                        interval_ms,
+                    )
+                    .await?;
+                    skipped_page = Some((
+                        current_cursor.to_owned(),
+                        resume_cursor,
+                        details,
+                        offset_advance,
+                        known_error,
+                    ));
+                    page
+                } else {
+                    match qzone::fetch_feeds(&login, "2", Some(current_cursor)).await {
+                        Ok(page) => page,
+                        Err(error) if qzone::feed_error_can_skip(&error) => {
+                            let details =
+                                parse_feed_cursor(current_cursor).map_err(|cursor_error| {
+                                    format!("{error}；且无法自动跳过该页：{cursor_error}")
+                                })?;
+                            let page_number = archive
+                                .progress
+                                .lock()
+                                .map_err(|_| "归档状态锁已损坏")?
+                                .pages
+                                .saturating_add(1);
+                            record_archive_skip(
+                                &app,
+                                &owner_uin,
+                                SkipRecord {
+                                    cursor: current_cursor,
+                                    resume_cursor: current_cursor,
+                                    page_number,
+                                    details,
+                                    offset_advance: 0,
+                                    error: &error,
+                                },
+                            )?;
+                            let skip_count = unresolved_skip_count(&app, &owner_uin)?;
+                            set_progress(&archive, |progress| {
+                                progress.skipped = skip_count;
+                                progress.message = format!(
+                                    "第 {page_number} 页发生异常，已加入待重试列表，正在寻找后续可恢复位置…"
+                                );
+                            });
+                            let (page, resume_cursor, offset_advance) = fetch_after_skipped_cursor(
+                                &app,
+                                &login,
+                                &archive,
+                                &owner_uin,
+                                current_cursor,
+                                1,
+                                interval_ms,
+                            )
+                            .await?;
+                            skipped_page = Some((
+                                current_cursor.to_owned(),
+                                resume_cursor,
+                                details,
+                                offset_advance,
+                                error,
+                            ));
+                            page
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             } else {
                 qzone::fetch_feeds(&login, "1", None).await?
             };
@@ -791,22 +1547,57 @@ pub async fn start_feed_archive(
                     return Err("检测到重复分页游标，已停止以避免死循环".into());
                 }
             }
-            let saved = save_page(&app, &owner_uin, &page.feeds, next)?;
+            let did_skip = skipped_page.is_some();
+            if let Some((failed_cursor, resume_cursor, details, offset_advance, error)) =
+                skipped_page.as_ref()
+            {
+                let page_number = archive
+                    .progress
+                    .lock()
+                    .map_err(|_| "归档状态锁已损坏")?
+                    .pages
+                    .saturating_add(1);
+                record_archive_skip(
+                    &app,
+                    &owner_uin,
+                    SkipRecord {
+                        cursor: failed_cursor,
+                        resume_cursor,
+                        page_number,
+                        details: *details,
+                        offset_advance: *offset_advance,
+                        error,
+                    },
+                )?;
+            }
+            let saved = save_page(&app, &owner_uin, &page.feeds, next, reset_checkpoint_stats)?;
+            reset_checkpoint_stats = false;
+            let skip_count = unresolved_skip_count(&app, &owner_uin)?;
             set_progress(&archive, |progress| {
                 progress.pages += 1;
                 progress.fetched += fetched;
                 progress.saved += saved;
-                progress.message = format!(
-                    "已归档 {} 页，共 {} 条记录",
-                    progress.pages, progress.fetched
-                );
+                progress.skipped = skip_count;
+                progress.message = if did_skip {
+                    format!(
+                        "已跳过 1 个异常位置并继续归档；当前 {} 页，共 {} 条记录",
+                        progress.pages, progress.fetched
+                    )
+                } else {
+                    format!(
+                        "已归档 {} 页，共 {} 条记录",
+                        progress.pages, progress.fetched
+                    )
+                };
             });
             if !page.has_more {
                 return Ok(());
             }
             cursor = next.map(str::to_owned);
-            let jitter = (now() as u64 % interval_ms.max(1)) + (interval_ms / 2);
-            tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(
+                interval_ms,
+            )))
+            .await;
         }
     }
     .await;
@@ -818,11 +1609,21 @@ pub async fn start_feed_archive(
         }),
         Ok(()) => set_progress(&archive, |p| {
             p.status = "completed";
-            p.message = format!("归档完成，共保存 {} 条记录", p.saved);
+            p.message = if p.skipped > 0 {
+                format!(
+                    "归档完成，共保存 {} 条记录；另有 {} 个异常位置已跳过，可在下方单独重试",
+                    p.saved, p.skipped
+                )
+            } else {
+                format!("归档完成，共保存 {} 条记录", p.saved)
+            };
             p.retry_at = None;
         }),
         Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => set_progress(&archive, |p| {
-            let retry_at = error.trim_start_matches("ARCHIVE_RATE_LIMIT:").parse::<i64>().ok();
+            let retry_at = error
+                .trim_start_matches("ARCHIVE_RATE_LIMIT:")
+                .parse::<i64>()
+                .ok();
             p.status = "limited";
             p.retry_at = retry_at;
             p.message = "为防止接口请求过于频繁，每 10 分钟最多归档 300 页。达到限制后已安全暂停，倒计时结束即可从当前进度继续归档。".into();
@@ -841,7 +1642,7 @@ pub async fn start_feed_archive(
                 serde_json::to_string_pretty(&detail).unwrap_or_else(|_| detail.to_string())
             );
             p.status = "error";
-            p.message = "服务繁忙，请稍后再试".into();
+            p.message = format!("归档失败：{}", concise_archive_error(_error));
             p.retry_at = None;
         }),
     }
@@ -850,8 +1651,14 @@ pub async fn start_feed_archive(
         .lock()
         .map_err(|_| "归档状态锁已损坏")?
         .clone();
-    if result.as_ref().is_err_and(|error| error.starts_with("ARCHIVE_RATE_LIMIT:")) { Ok(progress) }
-    else { result.map(|_| progress) }
+    if result
+        .as_ref()
+        .is_err_and(|error| error.starts_with("ARCHIVE_RATE_LIMIT:"))
+    {
+        Ok(progress)
+    } else {
+        result.map(|_| progress)
+    }
 }
 
 #[tauri::command]
@@ -863,6 +1670,111 @@ pub fn get_archive_progress(
         .lock()
         .map(|value| value.clone())
         .map_err(|_| "归档状态锁已损坏".into())
+}
+
+#[tauri::command]
+pub async fn list_archive_skips(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<ArchiveSkipItem>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id,page_number,cursor_offset,offset_advance,base_time,error,skipped_at,
+                    retry_count,last_retry_at,resolved_at,recovered_records
+             FROM archive_skips WHERE owner_uin=?1
+             ORDER BY resolved_at IS NOT NULL, skipped_at DESC",
+        )
+        .map_err(|error| format!("读取异常跳过列表失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok(ArchiveSkipItem {
+                id: row.get(0)?,
+                page_number: row.get(1)?,
+                cursor_offset: row.get(2)?,
+                offset_advance: row.get(3)?,
+                base_time: row.get(4)?,
+                error: row.get(5)?,
+                skipped_at: row.get(6)?,
+                retry_count: row.get(7)?,
+                last_retry_at: row.get(8)?,
+                resolved_at: row.get(9)?,
+                recovered_records: row.get(10)?,
+            })
+        })
+        .map_err(|error| format!("查询异常跳过列表失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("解析异常跳过列表失败：{error}"))
+}
+
+#[tauri::command]
+pub async fn retry_archive_skip(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    archive: tauri::State<'_, ArchiveState>,
+    id: i64,
+) -> Result<ArchiveSkipRetryResult, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let (cursor, resolved_at) = connection
+        .query_row(
+            "SELECT cursor,resolved_at FROM archive_skips WHERE id=?1 AND owner_uin=?2",
+            params![id, owner_uin],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "找不到这条异常跳过记录".into(),
+            _ => format!("读取异常跳过记录失败：{error}"),
+        })?;
+    if resolved_at.is_some() {
+        return Ok(ArchiveSkipRetryResult {
+            success: true,
+            message: "该异常位置已经重试成功".into(),
+            recovered_records: 0,
+        });
+    }
+    if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
+        return Err(format!("请求频率保护中，请在 {retry_at} 后重试"));
+    }
+    let attempted_at = now();
+    match qzone::fetch_feeds(&login, "2", Some(&cursor)).await {
+        Ok(page) => {
+            let recovered_records = page.feeds.len() as u64;
+            save_retried_page(&app, &owner_uin, &page.feeds)?;
+            let connection = open_database(&app)?;
+            connection
+                .execute(
+                    "UPDATE archive_skips SET retry_count=retry_count+1,last_retry_at=?2,
+                  resolved_at=?2,recovered_records=?3 WHERE id=?1 AND owner_uin=?4",
+                    params![id, attempted_at, recovered_records, owner_uin],
+                )
+                .map_err(|error| format!("更新异常重试结果失败：{error}"))?;
+            let remaining = unresolved_skip_count(&app, &owner_uin)?;
+            set_progress(&archive, |progress| progress.skipped = remaining);
+            Ok(ArchiveSkipRetryResult {
+                success: true,
+                message: format!("重试成功，已恢复 {recovered_records} 条接口记录"),
+                recovered_records,
+            })
+        }
+        Err(error) => {
+            let summary = concise_archive_error(&error);
+            let connection = open_database(&app)?;
+            connection
+                .execute(
+                    "UPDATE archive_skips SET retry_count=retry_count+1,last_retry_at=?2,error=?3
+                 WHERE id=?1 AND owner_uin=?4",
+                    params![id, attempted_at, summary, owner_uin],
+                )
+                .map_err(|reason| format!("保存异常重试失败结果失败：{reason}"))?;
+            Ok(ArchiveSkipRetryResult {
+                success: false,
+                message: format!("重试仍然失败：{summary}"),
+                recovered_records: 0,
+            })
+        }
+    }
 }
 
 #[tauri::command]
@@ -975,9 +1887,11 @@ pub async fn list_archived_media(
          WHERE owner_uin=?1 AND category IN ('self','other') AND (pictures_json IS NOT NULL OR video_json IS NOT NULL)
          ORDER BY 1 DESC",
     ).map_err(|error| format!("读取媒体年份失败：{error}"))?;
-    let years = year_statement.query_map(params![owner_uin], |row| row.get::<_, i32>(0))
+    let years = year_statement
+        .query_map(params![owner_uin], |row| row.get::<_, i32>(0))
         .map_err(|error| format!("查询媒体年份失败：{error}"))?
-        .filter_map(Result::ok).collect::<Vec<_>>();
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
     drop(year_statement);
 
     let mut statement = connection.prepare(
@@ -987,30 +1901,62 @@ pub async fn list_archived_media(
            AND (?2 IS NULL OR CAST(strftime('%Y',published_at,'unixepoch','localtime') AS INTEGER)=?2)
          ORDER BY published_at ASC,id ASC",
     ).map_err(|error| format!("读取媒体归档失败：{error}"))?;
-    let rows = statement.query_map(params![owner_uin, year], |row| Ok((
-        row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?,
-        row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?,
-        row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?,
-    ))).map_err(|error| format!("查询媒体归档失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin, year], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| format!("查询媒体归档失败：{error}"))?;
     let mut all = Vec::new();
     for row in rows {
         let (id, published_at, content, author_uin, author_name, pictures_json, video_json) =
             row.map_err(|error| format!("读取媒体记录失败：{error}"))?;
         for (index, url) in picture_urls(pictures_json).into_iter().enumerate() {
-            all.push(ArchiveMediaItem { key: format!("{id}-photo-{index}"), dynamic_id: id, media_type: "photo", url,
-                cover_url: None, published_at, author_uin: author_uin.clone(), author_name: author_name.clone(), content: content.clone() });
+            all.push(ArchiveMediaItem {
+                key: format!("{id}-photo-{index}"),
+                dynamic_id: id,
+                media_type: "photo",
+                picture_index: Some(index),
+                url,
+                cover_url: None,
+                published_at,
+                author_uin: author_uin.clone(),
+                author_name: author_name.clone(),
+                content: content.clone(),
+            });
         }
         let videos = video_urls(video_json.clone());
         if let Some(url) = videos.first() {
-            all.push(ArchiveMediaItem { key: format!("{id}-video"), dynamic_id: id, media_type: "video", url: url.clone(),
-                cover_url: video_cover_url(video_json), published_at, author_uin, author_name, content });
+            all.push(ArchiveMediaItem {
+                key: format!("{id}-video"),
+                dynamic_id: id,
+                media_type: "video",
+                picture_index: None,
+                url: url.clone(),
+                cover_url: video_cover_url(video_json),
+                published_at,
+                author_uin,
+                author_name,
+                content,
+            });
         }
     }
     let total = all.len();
     let start = (offset as usize).min(total);
     let end = (start + limit.clamp(1, 100) as usize).min(total);
     let items = all.drain(start..end).collect();
-    Ok(ArchiveMediaPage { items, total, years })
+    Ok(ArchiveMediaPage {
+        items,
+        total,
+        years,
+    })
 }
 
 #[tauri::command]
@@ -1035,21 +1981,42 @@ pub async fn get_archived_feed(
                 like_count: row.get(9)?, comment_count: row.get(10)?, likes: vec![], comments: vec![] })
         },
     ).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => "原始动态不存在或已删除".into(), _ => format!("读取原始动态失败：{error}") })?;
-    let mut comments = connection.prepare(
-        "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
+    let mut comments = connection
+        .prepare(
+            "SELECT comments_json,actor_uin,actor_name,event_summary,event_time FROM archive_feeds
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
-    ).map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = comments.query_map(params![item.owner_uin, item.cell_id], |row| Ok(comment_from_values(
-        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
-        .map_err(|error| format!("查询动态评论失败：{error}"))?.filter_map(Result::ok).collect();
+        )
+        .map_err(|error| format!("准备评论查询失败：{error}"))?;
+    item.comments = comments
+        .query_map(params![item.owner_uin, item.cell_id], |row| {
+            Ok(comment_from_values(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(|error| format!("查询动态评论失败：{error}"))?
+        .filter_map(Result::ok)
+        .collect();
     drop(comments);
-    let mut likes_stmt = connection.prepare(
-        "SELECT actor_uin,actor_name FROM archive_feeds
+    let mut likes_stmt = connection
+        .prepare(
+            "SELECT actor_uin,actor_name FROM archive_feeds
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type=217 ORDER BY event_time ASC",
-    ).map_err(|error| format!("准备点赞查询失败：{error}"))?;
-    item.likes = likes_stmt.query_map(params![item.owner_uin, item.cell_id], |row| {
-        Ok(LikeUser { uin: row.get(0)?, nickname: row.get(1)? })
-    }).map_err(|error| format!("查询点赞用户失败：{error}"))?.filter_map(Result::ok).collect();
+        )
+        .map_err(|error| format!("准备点赞查询失败：{error}"))?;
+    item.likes = likes_stmt
+        .query_map(params![item.owner_uin, item.cell_id], |row| {
+            Ok(LikeUser {
+                uin: row.get(0)?,
+                nickname: row.get(1)?,
+            })
+        })
+        .map_err(|error| format!("查询点赞用户失败：{error}"))?
+        .filter_map(Result::ok)
+        .collect();
     Ok(item)
 }
 
@@ -1214,7 +2181,10 @@ fn archive_items_for_export(
     for item in &mut items {
         let likes = export_likes
             .query_map(params![item.owner_uin, item.cell_id], |row| {
-                Ok(LikeUser { uin: row.get(0)?, nickname: row.get(1)? })
+                Ok(LikeUser {
+                    uin: row.get(0)?,
+                    nickname: row.get(1)?,
+                })
             })
             .map_err(|error| format!("查询导出点赞用户失败：{error}"))?;
         item.likes = likes.filter_map(Result::ok).collect();
@@ -1289,9 +2259,19 @@ pub async fn export_archived_html(
         cards.push_str("<div class=\"stats\">");
         if !item.likes.is_empty() {
             cards.push_str("♥ ");
-            let names: Vec<String> = item.likes.iter().take(10).map(|l| {
-                html_escape(l.nickname.as_deref().or(l.uin.as_deref()).unwrap_or("QQ用户"))
-            }).collect();
+            let names: Vec<String> = item
+                .likes
+                .iter()
+                .take(10)
+                .map(|l| {
+                    html_escape(
+                        l.nickname
+                            .as_deref()
+                            .or(l.uin.as_deref())
+                            .unwrap_or("QQ用户"),
+                    )
+                })
+                .collect();
             cards.push_str(&names.join("、"));
             if item.likes.len() > 10 {
                 cards.push_str(" 等 ");
@@ -1417,8 +2397,9 @@ pub async fn get_interaction_ranking(
 ) -> Result<Vec<InteractionRank>, String> {
     let owner_uin = login.qzone_auth().await?.uin;
     let connection = open_database(&app)?;
-    let mut statement = connection.prepare(
-        "SELECT actor_uin,COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),COUNT(*),
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_uin,COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),COUNT(*),
                 SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),
                 SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END)
          FROM archive_feeds
@@ -1426,17 +2407,22 @@ pub async fn get_interaction_ranking(
            AND event_type IN (2,217,311)
          GROUP BY actor_uin
          ORDER BY COUNT(*) DESC,MAX(event_time) DESC
-         LIMIT ?2"
-    ).map_err(|error| format!("准备互动排行榜查询失败：{error}"))?;
-    let rows = statement.query_map(params![owner_uin, limit.clamp(1, 50)], |row| {
-        Ok(InteractionRank {
-            uin: row.get(0)?, nickname: row.get(1)?,
-            interactions: row.get::<_, i64>(2)?.max(0) as u64,
-            likes: row.get::<_, i64>(3)?.max(0) as u64,
-            comments: row.get::<_, i64>(4)?.max(0) as u64,
+         LIMIT ?2",
+        )
+        .map_err(|error| format!("准备互动排行榜查询失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin, limit.clamp(1, 50)], |row| {
+            Ok(InteractionRank {
+                uin: row.get(0)?,
+                nickname: row.get(1)?,
+                interactions: row.get::<_, i64>(2)?.max(0) as u64,
+                likes: row.get::<_, i64>(3)?.max(0) as u64,
+                comments: row.get::<_, i64>(4)?.max(0) as u64,
+            })
         })
-    }).map_err(|error| format!("查询互动排行榜失败：{error}"))?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|error| format!("读取互动排行榜失败：{error}"))
+        .map_err(|error| format!("查询互动排行榜失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取互动排行榜失败：{error}"))
 }
 
 fn ensure_archive_idle(state: &ArchiveState) -> Result<(), String> {
@@ -1513,7 +2499,10 @@ pub async fn clear_archived_feeds(
         )
         .map_err(|error| format!("清空归档续传位置失败：{error}"))?;
     connection
-        .execute("DELETE FROM archive_rate_limits WHERE owner_uin=?1", params![owner_uin])
+        .execute(
+            "DELETE FROM archive_rate_limits WHERE owner_uin=?1",
+            params![owner_uin],
+        )
         .map_err(|error| format!("清空归档频率记录失败：{error}"))?;
     Ok(dynamics as u64)
 }
@@ -1527,18 +2516,44 @@ pub async fn delete_all_app_data(
     ensure_archive_idle(&state)?;
     login.clear_session().await;
     let database = database_path(&app)?;
-    for path in [database.clone(), PathBuf::from(format!("{}-wal", database.display())), PathBuf::from(format!("{}-shm", database.display()))] {
-        if path.exists() { fs::remove_file(&path).map_err(|error| format!("删除应用数据库失败：{error}"))?; }
+    for path in [
+        database.clone(),
+        PathBuf::from(format!("{}-wal", database.display())),
+        PathBuf::from(format!("{}-shm", database.display())),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|error| format!("删除应用数据库失败：{error}"))?;
+        }
     }
-    let videos = app.path().app_cache_dir().map_err(|error| format!("无法获取缓存目录：{error}"))?.join("videos");
-    if videos.exists() { fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?; }
-    if let Ok(mut progress) = state.progress.lock() { *progress = ArchiveProgress::default(); }
+    let videos = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取缓存目录：{error}"))?
+        .join("videos");
+    if videos.exists() {
+        fs::remove_dir_all(videos).map_err(|error| format!("删除视频缓存失败：{error}"))?;
+    }
+    let images = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取图片归档目录：{error}"))?
+        .join("images");
+    if images.exists() {
+        fs::remove_dir_all(images).map_err(|error| format!("删除图片归档失败：{error}"))?;
+    }
+    if let Ok(mut progress) = state.progress.lock() {
+        *progress = ArchiveProgress::default();
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_feed;
+    use super::{
+        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, parse_feed,
+        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, ArchiveCheckpoint,
+        FeedCursorDetails,
+    };
     use serde_json::json;
 
     #[test]
@@ -1563,5 +2578,117 @@ mod tests {
         assert_eq!(parsed.event_type, 2);
         assert_eq!(parsed.picture_count, 2);
         assert!(parsed.comments_json.is_some());
+    }
+
+    #[test]
+    fn creates_stable_key_for_feed_without_server_identifiers() {
+        let feed = json!({
+          "comm":{"subid":999,"time":1751637966},
+          "summary":{"summary":"一种没有 feedskey 和 cell_id 的特殊互动"},
+          "userinfo":{"user":{"uin":"3","nickname":"互动用户"}}
+        });
+
+        let first = parse_feed(&feed).expect("特殊互动不应中断整页归档");
+        let second = parse_feed(&feed).expect("同一互动应当能重复解析");
+
+        assert!(first.feed_key.starts_with("fallback:999:1751637966:3:"));
+        assert_eq!(first.feed_key, second.feed_key);
+    }
+
+    #[test]
+    fn expires_old_resume_cursor_without_discarding_archive_rows() {
+        let checkpoint = ArchiveCheckpoint {
+            cursor: "temporary-cursor".into(),
+            pages: 78,
+            fetched: 706,
+            saved: 706,
+            updated_at: 1_000,
+        };
+
+        assert!(!checkpoint_is_stale(&checkpoint, 1_599));
+        assert!(checkpoint_is_stale(&checkpoint, 1_600));
+    }
+
+    #[test]
+    fn configured_interval_is_never_shortened_by_jitter() {
+        let delay = archive_page_delay_ms(3_000);
+        assert!((3_000..=3_750).contains(&delay));
+    }
+
+    #[test]
+    fn advances_nested_qzone_cursor_without_changing_its_time_boundary() {
+        let cursor = "att=back%5Fserver%5Finfo%3Doffset%253D1168%2526total%253D4%2526basetime%253D1495974154%2526feedsource%253D1&lastrefreshtime=1785906139&lastseparatortime=0&loadcount=77&refresh_id=1785906139&tl=1495974154";
+
+        assert_eq!(
+            parse_feed_cursor(cursor).unwrap(),
+            FeedCursorDetails {
+                offset: 1168,
+                base_time: 1495974154,
+                load_count: 77,
+            }
+        );
+        let advanced = advance_feed_cursor(cursor, 2).unwrap();
+        assert_eq!(
+            parse_feed_cursor(&advanced).unwrap(),
+            FeedCursorDetails {
+                offset: 1170,
+                base_time: 1495974154,
+                load_count: 78,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_loadcount_inside_att_and_preserves_that_shape() {
+        let backend = serialize_query_pairs(&[
+            ("offset".into(), "1168".into()),
+            ("basetime".into(), "1495974154".into()),
+        ]);
+        let attach = serialize_query_pairs(&[
+            ("back_server_info".into(), backend),
+            ("loadcount".into(), "0".into()),
+        ]);
+        let cursor =
+            serialize_query_pairs(&[("att".into(), attach), ("tl".into(), "1495974154".into())]);
+
+        let advanced = advance_feed_cursor(&cursor, 1).unwrap();
+        assert_eq!(
+            parse_feed_cursor(&advanced).unwrap(),
+            FeedCursorDetails {
+                offset: 1169,
+                base_time: 1495974154,
+                load_count: 1,
+            }
+        );
+        let outer = super::parse_query_pairs(&advanced);
+        assert!(super::pair_value(&outer, "loadcount").is_none());
+        let attach = super::parse_query_pairs(super::pair_value(&outer, "att").unwrap());
+        assert_eq!(super::pair_value(&attach, "loadcount"), Some("1"));
+    }
+
+    #[test]
+    fn defaults_missing_loadcount_and_adds_it_inside_att() {
+        let backend = serialize_query_pairs(&[
+            ("offset".into(), "1168".into()),
+            ("basetime".into(), "1495974154".into()),
+        ]);
+        let attach = serialize_query_pairs(&[("back_server_info".into(), backend)]);
+        let cursor = serialize_query_pairs(&[("att".into(), attach)]);
+
+        assert_eq!(parse_feed_cursor(&cursor).unwrap().load_count, 0);
+        let advanced = advance_feed_cursor(&cursor, 1).unwrap();
+        assert_eq!(parse_feed_cursor(&advanced).unwrap().load_count, 1);
+    }
+
+    #[test]
+    fn probes_large_skip_ranges_exponentially() {
+        assert_eq!(
+            skip_probe_offsets(1),
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        );
+        assert_eq!(
+            skip_probe_offsets(20),
+            vec![20, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+        );
     }
 }
