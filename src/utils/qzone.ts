@@ -15,7 +15,12 @@ export function fetchMoreFeeds(attachInfo: string) {
 }
 
 export type ArchiveStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
-export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; message: string; retryAt?: number; }
+export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; }
+export interface ArchiveSkipItem {
+  id: number; pageNumber: number; cursorOffset: number; offsetAdvance: number; baseTime: number;
+  error: string; skippedAt: number; retryCount: number; lastRetryAt?: number; resolvedAt?: number; recoveredRecords: number;
+}
+export interface ArchiveSkipRetryResult { success: boolean; message: string; recoveredRecords: number; }
 export interface ArchiveItem {
   id: number; cellId: string; publishedAt: number; content?: string; authorUin?: string;
   authorName?: string; pictureUrls: string[]; videoUrl?: string; videoUrls: string[]; videoCoverUrl?: string; likeCount: number; commentCount: number;
@@ -31,6 +36,8 @@ export interface ArchiveMediaPage { items: ArchiveMediaItem[]; total: number; ye
 export const startFeedArchive = (intervalMs: number) => invoke<ArchiveProgress>("start_feed_archive", { intervalMs });
 export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_progress");
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
+export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
+export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
 export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self") => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category });
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });

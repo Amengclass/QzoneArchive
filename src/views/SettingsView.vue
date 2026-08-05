@@ -6,7 +6,7 @@ import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
-import { DEFAULT_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
+import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
 import { deleteAllAppData } from "../utils/qzone";
 
 const authStore = useAuthStore();
@@ -46,7 +46,7 @@ async function deleteEverything() {
 
     <article class="surface-card settings-card interval-setting">
       <div class="settings-copy"><span class="settings-icon tone-green"><i class="pi pi-clock" /></span><div><h3>单页获取间隔</h3><p>每读取一页后等待一段时间再请求下一页，间隔越久越稳定。</p></div></div>
-      <div class="interval-control"><InputNumber v-model="intervalMs" :min="500" :max="30000" :step="500" suffix=" ms" show-buttons button-layout="horizontal" decrement-button-icon="pi pi-minus" increment-button-icon="pi pi-plus" /><small>最低 500ms，建议 1000–2000ms</small></div>
+      <div class="interval-control"><InputNumber v-model="intervalMs" :min="MIN_ARCHIVE_INTERVAL" :max="30000" :step="500" suffix=" ms" show-buttons button-layout="horizontal" decrement-button-icon="pi pi-minus" increment-button-icon="pi pi-plus" /><small>最低 2000ms，建议 3000–5000ms</small></div>
     </article>
 
     <article class="surface-card settings-card">

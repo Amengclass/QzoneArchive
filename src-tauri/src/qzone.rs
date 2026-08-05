@@ -1,10 +1,47 @@
-use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, PRAGMA, REFERER, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, COOKIE, ORIGIN, PRAGMA, REFERER, USER_AGENT,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::qlogin::QLoginState;
 
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
+const FEED_RESPONSE_ATTEMPTS: u32 = 3;
+
+fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return Some(format!("HTTP {status}"));
+    }
+    if !status.is_success() {
+        return None;
+    }
+    let value = match serde_json::from_str::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return Some("响应不是有效 JSON".into()),
+    };
+    if let Some(code) = value.get("code").and_then(Value::as_i64) {
+        if code != 0 {
+            let message = value
+                .get("message")
+                .or_else(|| value.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
+            let permanent = ["未登录", "登录失效", "权限", "封禁", "禁止访问", "p_skey"]
+                .iter()
+                .any(|keyword| message.contains(keyword));
+            return (!permanent).then(|| format!("接口错误 {code}：{message}"));
+        }
+    }
+    if value.get("data").is_none() {
+        return Some("响应中暂时缺少 data".into());
+    }
+    None
+}
+
+fn feed_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
+}
 
 fn sec_ch_ua(user_agent: &str) -> &'static str {
     if user_agent.contains("Chrome") {
@@ -15,7 +52,11 @@ fn sec_ch_ua(user_agent: &str) -> &'static str {
 }
 
 fn sec_platform(user_agent: &str) -> &'static str {
-    if user_agent.contains("iPhone") { "\"iOS\"" } else { "\"Android\"" }
+    if user_agent.contains("iPhone") {
+        "\"iOS\""
+    } else {
+        "\"Android\""
+    }
 }
 fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<Value> {
     headers
@@ -86,8 +127,8 @@ fn log_feed_request_error(
         },
         "transportAttempts": attempts,
     });
-    let formatted = serde_json::to_string_pretty(&diagnostic)
-        .unwrap_or_else(|_| diagnostic.to_string());
+    let formatted =
+        serde_json::to_string_pretty(&diagnostic).unwrap_or_else(|_| diagnostic.to_string());
     eprintln!("\n================ QZONE ARCHIVE REQUEST ERROR ================\n{formatted}");
     if let Some(text) = response_body {
         eprintln!("---------------- RAW RESPONSE BODY ----------------\n{text}\n---------------- END RAW RESPONSE BODY ----------------");
@@ -106,24 +147,61 @@ pub struct FeedPage {
 fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
     if let Some(code) = value.get("code").and_then(Value::as_i64) {
         if code != 0 {
-            let message = value.get("message").or_else(|| value.get("msg"))
-                .and_then(Value::as_str).unwrap_or("未知错误");
+            let message = value
+                .get("message")
+                .or_else(|| value.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("未知错误");
             return Err(format!("QQ 空间动态接口返回错误 {code}：{message}"));
         }
     }
     let data = value.get("data").ok_or("动态响应中缺少 data")?;
-    let feeds = data.get("vFeeds").and_then(Value::as_array).cloned().unwrap_or_default();
-    let attach_info = data.get("attachinfo").and_then(Value::as_str)
-        .filter(|value| !value.is_empty()).map(str::to_owned);
+    let feeds = data
+        .get("vFeeds")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let attach_info = data
+        .get("attachinfo")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let server_has_more = data.get("hasmore").and_then(Value::as_i64).unwrap_or(0) != 0;
     let has_more = server_has_more && !feeds.is_empty() && attach_info.is_some();
-    Ok(FeedPage { feeds, attach_info, has_more })
+    Ok(FeedPage {
+        feeds,
+        attach_info,
+        has_more,
+    })
 }
 
 pub(crate) async fn fetch_feeds(
     state: &QLoginState,
     refresh_type: &str,
     attach_info: Option<&str>,
+) -> Result<FeedPage, String> {
+    fetch_feeds_with_attempts(state, refresh_type, attach_info, FEED_RESPONSE_ATTEMPTS).await
+}
+
+pub(crate) async fn fetch_feeds_once(
+    state: &QLoginState,
+    refresh_type: &str,
+    attach_info: Option<&str>,
+) -> Result<FeedPage, String> {
+    fetch_feeds_with_attempts(state, refresh_type, attach_info, 1).await
+}
+
+pub(crate) fn feed_error_can_skip(error: &str) -> bool {
+    error.contains("HTTP 5")
+        || error.starts_with("解析空间动态失败：")
+        || error.starts_with("QQ 空间动态接口返回错误")
+}
+
+async fn fetch_feeds_with_attempts(
+    state: &QLoginState,
+    refresh_type: &str,
+    attach_info: Option<&str>,
+    attempts: u32,
 ) -> Result<FeedPage, String> {
     let auth = state.qzone_auth().await?;
     let mut query = vec![
@@ -135,7 +213,17 @@ pub(crate) async fn fetch_feeds(
     if let Some(attach_info) = attach_info {
         if attach_info.trim().is_empty() {
             let error = "分页游标不能为空";
-            log_feed_request_error("validate_request", FEEDS_URL, &query, &auth.user_agent, None, None, None, &[], error);
+            log_feed_request_error(
+                "validate_request",
+                FEEDS_URL,
+                &query,
+                &auth.user_agent,
+                None,
+                None,
+                None,
+                &[],
+                error,
+            );
             return Err(error.into());
         }
         query.push(("res_attach", attach_info.to_owned()));
@@ -151,8 +239,10 @@ pub(crate) async fn fetch_feeds(
     let mut failed_response_headers = None;
     let mut failed_response_body = None;
     let mut last_attempt_logged = false;
-    for attempt in 1..=3 {
-        match client.get(FEEDS_URL)
+    let attempts = attempts.max(1);
+    for attempt in 1..=attempts {
+        match client
+            .get(FEEDS_URL)
             .header(ACCEPT, "application/json")
             .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
             .header(CACHE_CONTROL, "no-cache")
@@ -168,7 +258,8 @@ pub(crate) async fn fetch_feeds(
             .header("Sec-Ch-Ua-Mobile", "?1")
             .header("Sec-Ch-Ua-Platform", sec_platform(&auth.user_agent))
             .query(&query)
-            .send().await
+            .send()
+            .await
         {
             Ok(mut value) => {
                 let status = value.status();
@@ -188,7 +279,7 @@ pub(crate) async fn fetch_feeds(
                 let body = String::from_utf8_lossy(&bytes).into_owned();
                 if let Some(reason) = read_error {
                     let detail = format!(
-                        "响应体读取失败（第 {attempt}/3 次，已接收 {} 字节）：{reason:#}",
+                        "响应体读取失败（第 {attempt}/{attempts} 次，已接收 {} 字节）：{reason:#}",
                         bytes.len()
                     );
                     transport_attempts.push(detail.clone());
@@ -208,29 +299,61 @@ pub(crate) async fn fetch_feeds(
                     failed_response_headers = Some(headers);
                     failed_response_body = Some(body);
                     last_attempt_logged = true;
-                    if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                    if attempt < attempts {
+                        tokio::time::sleep(feed_retry_delay(attempt)).await;
                     }
                 } else {
+                    if let Some(reason) = retryable_response_reason(status, &body) {
+                        let detail = format!("{reason}（第 {attempt}/{attempts} 次）");
+                        transport_attempts.push(detail.clone());
+                        log_feed_request_error(
+                            &format!("retryable_response_attempt_{attempt}"),
+                            &request_url,
+                            &query,
+                            &auth.user_agent,
+                            Some(status),
+                            Some(&headers),
+                            Some(&body),
+                            &transport_attempts,
+                            &detail,
+                        );
+                        if attempt < attempts {
+                            tokio::time::sleep(feed_retry_delay(attempt)).await;
+                            continue;
+                        }
+                    }
                     response = Some((status, headers, body));
                     break;
                 }
             }
             Err(error) => {
-                let kind = if error.is_timeout() { "请求超时" } else if error.is_connect() { "连接失败" } else { "传输失败" };
-                let detail = format!("{kind}（第 {attempt}/3 次）：{error:#}");
+                let kind = if error.is_timeout() {
+                    "请求超时"
+                } else if error.is_connect() {
+                    "连接失败"
+                } else {
+                    "传输失败"
+                };
+                let detail = format!("{kind}（第 {attempt}/{attempts} 次）：{error:#}");
                 transport_attempts.push(detail.clone());
                 last_error = Some(detail);
                 last_attempt_logged = false;
-                if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+                if attempt < attempts {
+                    tokio::time::sleep(feed_retry_delay(attempt)).await;
                 }
             }
         }
     }
     let Some((status, headers, body)) = response else {
-        let error = format!("获取空间动态失败：{}", last_error.unwrap_or_else(|| "未知网络错误".into()));
-        let stage = if failed_response_status.is_some() { "read_response" } else { "transport" };
+        let error = format!(
+            "获取空间动态失败：{}",
+            last_error.unwrap_or_else(|| "未知网络错误".into())
+        );
+        let stage = if failed_response_status.is_some() {
+            "read_response"
+        } else {
+            "transport"
+        };
         if !last_attempt_logged {
             log_feed_request_error(
                 stage,
@@ -248,21 +371,51 @@ pub(crate) async fn fetch_feeds(
     };
     if !status.is_success() {
         let error = format!("获取空间动态失败：HTTP {status}");
-        log_feed_request_error("http_status", &request_url, &query, &auth.user_agent, Some(status), Some(&headers), Some(&body), &transport_attempts, &error);
+        log_feed_request_error(
+            "http_status",
+            &request_url,
+            &query,
+            &auth.user_agent,
+            Some(status),
+            Some(&headers),
+            Some(&body),
+            &transport_attempts,
+            &error,
+        );
         return Err(error);
     }
     let value = match serde_json::from_str::<Value>(&body) {
         Ok(value) => value,
         Err(reason) => {
             let error = format!("解析空间动态失败：{reason}");
-            log_feed_request_error("parse_json", &request_url, &query, &auth.user_agent, Some(status), Some(&headers), Some(&body), &transport_attempts, &error);
+            log_feed_request_error(
+                "parse_json",
+                &request_url,
+                &query,
+                &auth.user_agent,
+                Some(status),
+                Some(&headers),
+                Some(&body),
+                &transport_attempts,
+                &error,
+            );
             return Err(error);
         }
     };
     match parse_feed_page(value) {
         Ok(page) => Ok(page),
         Err(error) => {
-            log_feed_request_error("parse_api_response", &request_url, &query, &auth.user_agent, Some(status), Some(&headers), Some(&body), &transport_attempts, &error);
+            log_feed_request_error(
+                "parse_api_response",
+                &request_url,
+                &query,
+                &auth.user_agent,
+                Some(status),
+                Some(&headers),
+                Some(&body),
+                &transport_attempts,
+                &error,
+            );
             Err(error)
         }
     }
@@ -283,15 +436,17 @@ pub async fn fetch_more_feeds(
 
 #[cfg(test)]
 mod tests {
+    use super::{feed_error_can_skip, parse_feed_page, retryable_response_reason, FEEDS_URL};
+    use reqwest::StatusCode;
     use serde_json::json;
-    use super::{parse_feed_page, FEEDS_URL};
 
     #[test]
     fn keeps_first_page_feeds_and_cursor() {
         let page = parse_feed_page(json!({
             "code": 0,
             "data": { "attachinfo": "next-cursor", "hasmore": 1, "vFeeds": [{"id": 1}] }
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(page.feeds.len(), 1);
         assert_eq!(page.attach_info.as_deref(), Some("next-cursor"));
         assert!(page.has_more);
@@ -307,8 +462,49 @@ mod tests {
     #[test]
     fn cursor_remains_server_encoded_until_query_serialization() {
         let cursor = "att=back%5Fserver%5Finfo%3Doffset%253D6&tl=123";
-        let encoded = reqwest::Url::parse_with_params(FEEDS_URL, &[("res_attach", cursor)]).unwrap();
-        assert!(encoded.as_str().contains("back%255Fserver%255Finfo%253Doffset%25253D6%26tl%3D123"));
-        assert_eq!(encoded.query_pairs().find(|(key, _)| key == "res_attach").unwrap().1, cursor);
+        let encoded =
+            reqwest::Url::parse_with_params(FEEDS_URL, &[("res_attach", cursor)]).unwrap();
+        assert!(encoded
+            .as_str()
+            .contains("back%255Fserver%255Finfo%253Doffset%25253D6%26tl%3D123"));
+        assert_eq!(
+            encoded
+                .query_pairs()
+                .find(|(key, _)| key == "res_attach")
+                .unwrap()
+                .1,
+            cursor
+        );
+    }
+
+    #[test]
+    fn retries_rate_limits_and_temporary_api_errors() {
+        assert!(retryable_response_reason(StatusCode::TOO_MANY_REQUESTS, "busy").is_some());
+        assert!(retryable_response_reason(
+            StatusCode::OK,
+            r#"{"code":-1,"message":"系统繁忙，请稍后再试"}"#,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn does_not_retry_expired_login_response() {
+        assert!(retryable_response_reason(
+            StatusCode::OK,
+            r#"{"code":-3000,"message":"登录失效，请重新登录"}"#,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn only_skips_page_specific_server_or_response_errors() {
+        assert!(feed_error_can_skip(
+            "获取空间动态失败：HTTP 500 Internal Server Error"
+        ));
+        assert!(feed_error_can_skip("解析空间动态失败：expected value"));
+        assert!(!feed_error_can_skip(
+            "获取空间动态失败：HTTP 429 Too Many Requests"
+        ));
+        assert!(!feed_error_can_skip("尚未登录 QQ 空间"));
     }
 }

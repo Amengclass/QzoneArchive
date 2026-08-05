@@ -25,6 +25,8 @@ pub fn run() {
             archive::start_feed_archive,
             archive::get_archive_progress,
             archive::cancel_feed_archive,
+            archive::list_archive_skips,
+            archive::retry_archive_skip,
             archive::list_archived_feeds,
             archive::list_archived_media,
             archive::get_archived_feed,
