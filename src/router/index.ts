@@ -16,6 +16,12 @@ const router = createRouter({
       meta: { title: "归档内容" },
     },
     {
+      path: "/contacts",
+      name: "contacts",
+      component: () => import("../views/ContactsView.vue"),
+      meta: { title: "联系人" },
+    },
+    {
       path: "/media",
       name: "media",
       component: () => import("../views/MediaView.vue"),

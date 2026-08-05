@@ -21,6 +21,7 @@ const showQzoneButton = computed(() => platform() !== "android");
 const navigation = [
   { label: "概览", icon: "pi pi-home", to: "/" },
   { label: "归档", icon: "pi pi-inbox", to: "/archives" },
+  { label: "联系人", icon: "pi pi-users", to: "/contacts" },
   { label: "媒体", icon: "pi pi-images", to: "/media" },
   { label: "任务", icon: "pi pi-sync", to: "/tasks" },
   { label: "设置", icon: "pi pi-cog", to: "/settings" },

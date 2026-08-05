@@ -53,6 +53,7 @@ let imageDragStart: { x: number; y: number; offsetX: number; offsetY: number } |
 let pinchStart: { distance: number; scale: number } | undefined;
 let longPressTimer: ReturnType<typeof setTimeout> | undefined;
 const expandedComments = reactive(new Set<number>());
+const expandedLikes = reactive(new Set<number>());
 let imageObserver: IntersectionObserver | undefined;
 const currentPlatform = platform();
 const desktopPlatforms = new Set(["windows", "macos", "linux"]);
@@ -303,7 +304,18 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
           <div class="video-cover-shade"><span class="video-play-button"><i :class="videoLoading[item.id] ? 'pi pi-spin pi-spinner' : 'pi pi-play'" /></span><strong>{{ videoLoading[item.id] ? "正在加载视频…" : "点击播放" }}</strong><small>{{ videoErrors[item.id] || "视频将在点击后下载" }}</small></div>
         </div>
         <div class="archive-assets">
-          <span class="archive-likes" v-if="item.likes.length"><i class="pi pi-heart" /><span class="archive-like-names">{{ item.likes.slice(0, 8).map(l => l.nickname || l.uin || 'QQ用户').join('、') }}</span><span v-if="item.likes.length > 8" class="archive-like-more">等 {{ item.likeCount }} 人赞了</span><span v-else> 赞了</span></span>
+          <span class="archive-likes" v-if="item.likes.length">
+            <i class="pi pi-heart" />
+            <template v-if="item.likes.length <= 10 || expandedLikes.has(item.id)">
+              <span class="archive-like-names">{{ item.likes.map(l => l.nickname || l.uin || 'QQ用户').join('、') }}</span>
+              <span> 赞了</span>
+              <button v-if="item.likes.length > 10" type="button" class="archive-like-toggle" @click="expandedLikes.delete(item.id)">收起</button>
+            </template>
+            <template v-else>
+              <span class="archive-like-names">{{ item.likes.slice(0, 10).map(l => l.nickname || l.uin || 'QQ用户').join('、') }}</span>
+              <button type="button" class="archive-like-toggle" @click="expandedLikes.add(item.id)">等 {{ item.likeCount }} 人赞了</button>
+            </template>
+          </span>
           <span v-if="item.commentCount"><i class="pi pi-comment" />{{ item.commentCount }} 条评论</span>
           <span v-if="item.pictureUrls.length"><i class="pi pi-images" />{{ item.pictureUrls.length }} 张图片</span>
           <span v-if="item.videoUrl"><i class="pi pi-video" />视频</span></div>

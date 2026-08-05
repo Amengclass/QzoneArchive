@@ -35,6 +35,7 @@ pub fn run() {
             archive::load_archived_image,
             archive::load_archived_video,
             archive::get_archive_overview,
+            archive::list_interactors,
             archive::get_interaction_ranking,
             archive::delete_archived_feeds,
             archive::clear_archived_feeds,

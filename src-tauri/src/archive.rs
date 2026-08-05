@@ -107,6 +107,17 @@ pub struct LikeUser {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Interactor {
+    uin: String,
+    nickname: String,
+    likes: u64,
+    comments: u64,
+    total: u64,
+    last_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArchiveOverview {
     dynamics: u64,
     pictures: u64,
@@ -2545,6 +2556,43 @@ pub async fn delete_all_app_data(
         *progress = ArchiveProgress::default();
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn list_interactors(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<Vec<Interactor>, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_uin, COALESCE(MAX(NULLIF(actor_name,'')),actor_uin),
+                    COUNT(*),
+                    SUM(CASE WHEN event_type=217 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN event_type IN (2,311) THEN 1 ELSE 0 END),
+                    MAX(event_time)
+             FROM archive_feeds
+             WHERE owner_uin=?1 AND actor_uin IS NOT NULL AND actor_uin<>'' AND actor_uin<>?1
+               AND event_type IN (2,217,311)
+             GROUP BY actor_uin
+             ORDER BY COUNT(*) DESC",
+        )
+        .map_err(|error| format!("准备联系人查询失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok(Interactor {
+                uin: row.get(0)?,
+                nickname: row.get(1)?,
+                total: row.get::<_, i64>(2)?.max(0) as u64,
+                likes: row.get::<_, i64>(3)?.max(0) as u64,
+                comments: row.get::<_, i64>(4)?.max(0) as u64,
+                last_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| format!("查询联系人失败：{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取联系人失败：{error}"))
 }
 
 #[cfg(test)]

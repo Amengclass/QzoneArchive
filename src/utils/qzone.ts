@@ -47,6 +47,8 @@ export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<st
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
 export interface ArchiveOverview { dynamics: number; pictures: number; comments: number; likes: number; databaseBytes: number; }
 export const getArchiveOverview = () => invoke<ArchiveOverview>("get_archive_overview");
+export interface Interactor { uin: string; nickname: string; likes: number; comments: number; total: number; lastAt: number; }
+export const listInteractors = () => invoke<Interactor[]>("list_interactors");
 export interface InteractionRank { uin: string; nickname: string; interactions: number; likes: number; comments: number; }
 export const getInteractionRanking = (limit = 8) => invoke<InteractionRank[]>("get_interaction_ranking", { limit });
 export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_archived_feeds", { ids });
