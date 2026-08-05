@@ -135,6 +135,10 @@ npm run tauri android build
 |------|--------|
 | ![微信赞赏](public/sponsor/wx.jpg) | ![支付宝赞赏](public/sponsor/zfb.jpg) |
 
+## 友情链接
+
+* [LINUX DO](https://linux.do/) - 新的理想型社区
+
 ## 许可证
 
 本项目采用 [GPLv3](LICENSE) 许可证。
