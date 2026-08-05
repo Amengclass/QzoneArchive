@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { platform } from "@tauri-apps/plugin-os";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { fetch } from "@tauri-apps/plugin-http";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import Button from "primevue/button";
@@ -10,8 +9,9 @@ import Checkbox from "primevue/checkbox";
 import Dialog from "primevue/dialog";
 import InputText from "primevue/inputtext";
 import Paginator, { type PageState } from "primevue/paginator";
+import QzoneText from "../components/QzoneText.vue";
+import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
-import { parseQzoneText } from "../utils/qzoneText";
 
 type DeleteAction = "selected" | "all";
 const records = ref<ArchiveItem[]>([]);
@@ -40,6 +40,7 @@ const videoErrors = reactive<Record<number, string>>({});
 const imageSources = reactive<Record<string, string>>({});
 const imageLoading = reactive<Record<string, boolean>>({});
 const imageErrors = reactive<Record<string, string>>({});
+const imageFallbackAttempted = reactive<Record<string, boolean>>({});
 const imagePreviewVisible = ref(false);
 const previewImageUrl = ref("");
 const previewImageName = ref("qzone-image.jpg");
@@ -85,10 +86,11 @@ function releaseVideos() {
   Object.values(videoSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(videoSources).forEach((key) => delete videoSources[Number(key)]);
   Object.keys(videoErrors).forEach((key) => delete videoErrors[Number(key)]);
-  Object.values(imageSources).forEach((url) => URL.revokeObjectURL(url));
+  Object.values(imageSources).forEach((url) => { if (url.startsWith("blob:")) URL.revokeObjectURL(url); });
   Object.keys(imageSources).forEach((key) => delete imageSources[key]);
   Object.keys(imageLoading).forEach((key) => delete imageLoading[key]);
   Object.keys(imageErrors).forEach((key) => delete imageErrors[key]);
+  Object.keys(imageFallbackAttempted).forEach((key) => delete imageFallbackAttempted[key]);
 }
 function observeArchiveImages() {
   imageObserver?.disconnect();
@@ -109,17 +111,36 @@ async function loadArchiveImage(url: string, dynamicId?: number, pictureIndex?: 
   if (!url || imageSources[url] || imageLoading[url]) return;
   imageLoading[url] = true;
   delete imageErrors[url];
+  delete imageFallbackAttempted[url];
   try {
     if (dynamicId !== undefined && pictureIndex !== undefined) {
-      imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
-    } else {
-      const response = await fetch(url, { method: "GET", headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8", Referer: "https://user.qzone.qq.com/" } });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const bytes = await response.arrayBuffer();
-      const contentType = response.headers.get("content-type") || "image/jpeg";
-      imageSources[url] = URL.createObjectURL(new Blob([bytes], { type: contentType }));
+      try {
+        imageSources[url] = convertFileSrc(await loadArchivedImage(dynamicId, pictureIndex));
+        return;
+      } catch (reason) {
+        console.warn("本地图片归档加载失败，改用原始地址", reason);
+      }
     }
+    await loadRemoteArchiveImage(url);
   } catch (reason) { imageErrors[url] = String(reason); console.error("归档图片加载失败", reason); }
+  finally { imageLoading[url] = false; }
+}
+async function loadRemoteArchiveImage(url: string) {
+  imageSources[url] = await loadRemoteImageBlob(url);
+}
+async function handleArchiveImageError(url: string) {
+  if (!url || imageLoading[url]) return;
+  const source = imageSources[url];
+  if (source?.startsWith("blob:")) URL.revokeObjectURL(source);
+  delete imageSources[url];
+  if (imageFallbackAttempted[url]) {
+    imageErrors[url] = "图片文件无法显示，可点击重试";
+    return;
+  }
+  imageFallbackAttempted[url] = true;
+  imageLoading[url] = true;
+  try { await loadRemoteArchiveImage(url); }
+  catch (reason) { imageErrors[url] = String(reason); }
   finally { imageLoading[url] = false; }
 }
 function imageExtension(url: string) {
@@ -274,11 +295,11 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
       <Checkbox v-model="selectedIds" class="archive-checkbox" :input-id="`archive-${item.id}`" :value="item.id" />
       <div class="archive-card-body">
         <header class="archive-dynamic-header"><span class="archive-avatar archive-publisher-avatar"><img v-if="item.authorUin" :src="avatarUrl(item.authorUin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span><div class="archive-publisher"><strong>{{ item.authorName || "我" }}</strong><span><span v-if="item.authorUin">QQ {{ item.authorUin }}</span><span>{{ formatTime(item.publishedAt) }}</span></span></div></header>
-        <p class="archive-dynamic-content"><span v-for="(part, index) in parseQzoneText(item.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }" :title="part.uin ? `QQ ${part.uin}` : undefined">{{ part.value }}</span></p>
-        <div v-if="item.pictureUrls.length" class="archive-picture-grid" :class="`pictures-${Math.min(item.pictureUrls.length, 4)}`"><template v-for="(url, pictureIndex) in item.pictureUrls.slice(0, 4)" :key="url"><button v-if="imageSources[url]" type="button" class="archive-picture-button" :aria-label="`查看动态图片 ${pictureIndex + 1}`" @click="openImagePreview(imageSources[url], url, item.cellId, pictureIndex)"><img :src="imageSources[url]" :alt="`动态图片 ${pictureIndex + 1}`" /></button><div v-else class="archive-image-loading" :data-archive-image="url" :data-dynamic-id="item.id" :data-picture-index="pictureIndex"><i class="pi pi-image" /><button v-if="imageErrors[url]" type="button" class="archive-image-retry" :title="imageErrors[url]" @click.stop="loadArchiveImage(url, item.id, pictureIndex)">加载失败，重试</button><span v-else>{{ imageLoading[url] ? "正在尝试多个图片地址" : "等待加载" }}</span></div></template><span v-if="item.pictureUrls.length > 4" class="picture-more">+{{ item.pictureUrls.length - 4 }}</span></div>
+        <p class="archive-dynamic-content"><QzoneText :value="item.content" /></p>
+        <div v-if="item.pictureUrls.length" class="archive-picture-grid" :class="`pictures-${Math.min(item.pictureUrls.length, 4)}`"><template v-for="(url, pictureIndex) in item.pictureUrls.slice(0, 4)" :key="url"><button v-if="imageSources[url]" type="button" class="archive-picture-button" :aria-label="`查看动态图片 ${pictureIndex + 1}`" @click="openImagePreview(imageSources[url], url, item.cellId, pictureIndex)"><img :src="imageSources[url]" :alt="`动态图片 ${pictureIndex + 1}`" @error="handleArchiveImageError(url)" /></button><div v-else class="archive-image-loading" :data-archive-image="url" :data-dynamic-id="item.id" :data-picture-index="pictureIndex"><i class="pi pi-image" /><button v-if="imageErrors[url]" type="button" class="archive-image-retry" :title="imageErrors[url]" @click.stop="loadArchiveImage(url, item.id, pictureIndex)">加载失败，重试</button><span v-else>{{ imageLoading[url] ? "正在尝试多个图片地址" : "等待加载" }}</span></div></template><span v-if="item.pictureUrls.length > 4" class="picture-more">+{{ item.pictureUrls.length - 4 }}</span></div>
         <video v-if="videoSources[item.id]" :id="`archive-video-${item.id}`" class="archive-video" :src="videoSources[item.id]" controls preload="metadata" playsinline />
         <div v-else-if="item.videoUrl" class="archive-video-cover" :class="{ 'is-loading': videoLoading[item.id] }" :data-archive-image="item.videoCoverUrl || undefined" role="button" tabindex="0" @click="loadVideo(item)" @keydown.enter="loadVideo(item)">
-          <img v-if="item.videoCoverUrl && imageSources[item.videoCoverUrl]" :src="imageSources[item.videoCoverUrl]" />
+          <img v-if="item.videoCoverUrl && imageSources[item.videoCoverUrl]" :src="imageSources[item.videoCoverUrl]" @error="handleArchiveImageError(item.videoCoverUrl)" />
           <div class="video-cover-shade"><span class="video-play-button"><i :class="videoLoading[item.id] ? 'pi pi-spin pi-spinner' : 'pi pi-play'" /></span><strong>{{ videoLoading[item.id] ? "正在加载视频…" : "点击播放" }}</strong><small>{{ videoErrors[item.id] || "视频将在点击后下载" }}</small></div>
         </div>
         <div class="archive-assets">
@@ -289,11 +310,11 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <section v-if="item.comments.length" class="archive-comments">
           <div v-for="comment in (expandedComments.has(item.id) ? item.comments : item.comments.slice(0, 3))" :key="`${comment.uin}-${comment.createdAt}-${comment.content}`" class="archive-comment">
             <span class="comment-avatar"><img v-if="comment.uin" :src="avatarUrl(comment.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-            <div class="archive-comment-body"><p><strong>{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><span v-for="(part, index) in parseQzoneText(comment.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }" :title="part.uin ? `QQ ${part.uin}` : undefined">{{ part.value }}</span></p><time>{{ formatTime(comment.createdAt) }}</time>
+            <div class="archive-comment-body"><p><strong>{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><QzoneText :value="comment.content" /></p><time>{{ formatTime(comment.createdAt) }}</time>
               <div v-if="comment.replies.length" class="archive-comment-replies">
                 <div v-for="(reply, replyIndex) in comment.replies" :key="`${reply.uin}-${reply.createdAt}-${replyIndex}`" class="archive-reply">
                   <span class="reply-avatar"><img v-if="reply.uin" :src="avatarUrl(reply.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-                  <div><p><strong>{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><span v-for="(part, index) in parseQzoneText(reply.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }" :title="part.uin ? `QQ ${part.uin}` : undefined">{{ part.value }}</span></p><time>{{ formatTime(reply.createdAt) }}</time></div>
+                  <div><p><strong>{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><QzoneText :value="reply.content" /></p><time>{{ formatTime(reply.createdAt) }}</time></div>
                 </div>
               </div>
             </div>

@@ -45,6 +45,7 @@ impl Default for ArchiveProgress {
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
+    image_downloads: tokio::sync::Semaphore,
 }
 
 impl ArchiveState {
@@ -52,6 +53,7 @@ impl ArchiveState {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
+            image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
 }
@@ -913,33 +915,29 @@ fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
                 Value::Object(items) => items.values().collect::<Vec<_>>(),
                 _ => vec![],
             };
-            let mut candidates = values
+            let candidates = values
                 .into_iter()
                 .filter_map(|item| {
                     let url = item.get("url")?.as_str()?.trim();
                     if url.is_empty() {
                         return None;
                     }
-                    let dimension = |name: &str| {
-                        item.get(name)
-                            .and_then(|value| {
-                                value
-                                    .as_u64()
-                                    .or_else(|| value.as_str()?.parse::<u64>().ok())
-                            })
-                            .unwrap_or(0)
-                    };
-                    Some((
-                        dimension("width").saturating_mul(dimension("height")),
-                        url.to_owned(),
-                    ))
+                    Some(url.to_owned())
                 })
                 .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| right.0.cmp(&left.0));
+            let mut candidates = candidates;
+            if let Some(url) = pic
+                .pointer("/busi_param/-1")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+            {
+                candidates.push(url.to_owned());
+            }
             let mut seen = HashSet::new();
             let urls = candidates
                 .into_iter()
-                .map(|(_, url)| {
+                .map(|url| {
                     if url.starts_with("//") {
                         format!("https:{url}")
                     } else {
@@ -980,10 +978,45 @@ fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
+    bytes.get(6..10).is_some_and(|size| {
+        let width = u16::from_le_bytes([size[0], size[1]]);
+        let height = u16::from_le_bytes([size[2], size[3]]);
+        (bytes.len() == 2_038 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (bytes.len() == 2_687
+                && bytes.starts_with(b"GIF89a")
+                && width == 340
+                && height == 320)
+            || (bytes.len() == 1_643 && bytes.starts_with(b"GIF87a") && width == 99 && height == 99)
+            || (bytes.len() == 1_547 && bytes.starts_with(b"GIF87a") && width == 98 && height == 98)
+    })
+}
+
+fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Option<PathBuf> {
+    ["jpg", "png", "gif", "webp", "avif", "bmp"]
+        .into_iter()
+        .map(|extension| image_dir.join(format!("{file_stem}.{extension}")))
+        .find_map(|path| {
+            if !path.metadata().is_ok_and(|metadata| metadata.len() > 32) {
+                return None;
+            }
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"))
+                && fs::read(&path).is_ok_and(|bytes| is_qq_missing_image_placeholder(&bytes))
+            {
+                let _ = fs::remove_file(&path);
+                return None;
+            }
+            Some(path)
+        })
+}
+
 #[tauri::command]
 pub async fn load_archived_image(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
     id: i64,
     picture_index: usize,
 ) -> Result<String, String> {
@@ -996,11 +1029,8 @@ pub async fn load_archived_image(
         .join(&auth.uin);
     fs::create_dir_all(&image_dir).map_err(|error| format!("无法创建图片归档目录：{error}"))?;
     let file_stem = format!("{id}-{picture_index}");
-    for extension in ["jpg", "png", "gif", "webp", "avif", "bmp"] {
-        let path = image_dir.join(format!("{file_stem}.{extension}"));
-        if path.metadata().is_ok_and(|metadata| metadata.len() > 32) {
-            return Ok(path.to_string_lossy().into_owned());
-        }
+    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
+        return Ok(path.to_string_lossy().into_owned());
     }
 
     let pictures_json = {
@@ -1020,6 +1050,14 @@ pub async fn load_archived_image(
         .into_iter()
         .nth(picture_index)
         .ok_or("该图片没有保存可用的 QQ 地址")?;
+    let _permit = state
+        .image_downloads
+        .acquire()
+        .await
+        .map_err(|_| "图片下载队列已关闭")?;
+    if let Some(path) = existing_archived_image(&image_dir, &file_stem) {
+        return Ok(path.to_string_lossy().into_owned());
+    }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -1060,12 +1098,25 @@ pub async fn load_archived_image(
                                 last_error = "QQ 返回了非图片内容".into();
                                 continue;
                             };
+                            if is_qq_missing_image_placeholder(&bytes) {
+                                last_error = "QQ 返回了图片不存在占位图".into();
+                                continue;
+                            }
                             let path = image_dir.join(format!("{file_stem}.{extension}"));
-                            let temporary = image_dir.join(format!("{file_stem}.part"));
+                            let nonce = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_nanos();
+                            let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
                             fs::write(&temporary, &bytes)
                                 .map_err(|error| format!("写入图片归档失败：{error}"))?;
-                            fs::rename(&temporary, &path)
-                                .map_err(|error| format!("保存图片归档失败：{error}"))?;
+                            if let Err(error) = fs::rename(&temporary, &path) {
+                                if !path.exists() {
+                                    let _ = fs::remove_file(&temporary);
+                                    return Err(format!("保存图片归档失败：{error}"));
+                                }
+                                let _ = fs::remove_file(&temporary);
+                            }
                             return Ok(path.to_string_lossy().into_owned());
                         }
                         Err(error) => last_error = format!("读取图片数据失败：{error}"),

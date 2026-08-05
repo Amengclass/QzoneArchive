@@ -6,10 +6,10 @@ import { useRouter } from "vue-router";
 import Button from "primevue/button";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
+import QzoneText from "../components/QzoneText.vue";
 import StatCard from "../components/StatCard.vue";
 import { useAuthStore } from "../stores/auth";
 import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
-import { parseQzoneText } from "../utils/qzoneText";
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -77,7 +77,7 @@ onBeforeUnmount(releaseAvatars);
     <article class="surface-card recent-card">
       <div class="section-heading"><div><span class="section-kicker">最近动态</span><h3>归档记录</h3></div><Button label="查看全部" severity="secondary" text size="small" :disabled="!loggedIn" @click="router.push('/archives')" /></div>
       <div v-if="recent.length" class="dashboard-recent-list">
-        <div v-for="item in recent" :key="item.id" class="dashboard-recent-item"><span class="dashboard-recent-avatar"><img v-if="item.authorUin && avatarSources[item.authorUin]" :src="avatarSources[item.authorUin]" /><i v-else class="pi pi-user" /></span><div><strong>{{ item.authorName || item.authorUin || "我" }}</strong><p><span v-for="(part, index) in parseQzoneText(item.content)" :key="index" :class="{ 'qzone-mention': part.type === 'mention' }">{{ part.value }}</span></p><small>{{ formatTime(item.publishedAt) }} · {{ item.likeCount }} 赞 · {{ item.commentCount }} 评论</small></div></div>
+        <div v-for="item in recent" :key="item.id" class="dashboard-recent-item"><span class="dashboard-recent-avatar"><img v-if="item.authorUin && avatarSources[item.authorUin]" :src="avatarSources[item.authorUin]" /><i v-else class="pi pi-user" /></span><div><strong>{{ item.authorName || item.authorUin || "我" }}</strong><p><QzoneText :value="item.content" /></p><small>{{ formatTime(item.publishedAt) }} · {{ item.likeCount }} 赞 · {{ item.commentCount }} 评论</small></div></div>
       </div>
       <div v-else class="empty-state compact"><span><i class="pi pi-inbox" /></span><h4>{{ loggedIn ? "还没有归档记录" : "尚未登录" }}</h4><p>{{ loggedIn ? "前往任务页面创建第一个归档任务。" : "登录 QQ 空间后即可查看当前账号的归档概览。" }}</p></div>
     </article>

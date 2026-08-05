@@ -47,6 +47,7 @@ html, body, #app { min-width: 320px; min-height: 100%; margin: 0; overflow-x: hi
 body { min-height: 100vh; min-height: 100dvh; }
 button, input { font: inherit; }
 .qzone-mention { color: var(--primary); font-weight: 600; }
+.qzone-emoji { display: inline-block; width: 24px; height: 24px; margin: 0 2px; object-fit: contain; vertical-align: -6px; }.qzone-emoji-missing { color: var(--muted); font-size: .86em; }
 
 html {
   -webkit-tap-highlight-color: transparent;

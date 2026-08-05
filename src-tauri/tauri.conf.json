@@ -28,7 +28,7 @@
       "csp": null,
       "assetProtocol": {
         "enable": true,
-        "scope": ["$APPCACHE/**/*", "$APPDATA/top.ehre.qzonearchive/images/**/*"]
+        "scope": ["$APPCACHE/**/*", "$APPDATA/images/**/*"]
       }
     }
   },
