@@ -63,7 +63,7 @@ async function deleteEverything() {
     <article class="surface-card settings-card about-card">
       <div class="about-main">
         <div class="settings-copy"><span class="settings-icon"><i class="pi pi-info-circle" /></span><div><h3>关于</h3><p>Qzone Archive · 跨平台空间归档工具</p><p class="author-line">作者：<button class="author-link" type="button" @click="openUrl('https://space.bilibili.com/1117414477')">LibraHp_0928 <i class="pi pi-external-link" /></button></p></div></div>
-        <span class="version-badge">v1.0.1</span>
+        <span class="version-badge">v1.0.2</span>
       </div>
       <div class="sponsor-section">
         <div class="sponsor-heading"><div><h4>赞助支持</h4><p>如果这个项目帮助到了你，可以请作者喝杯咖啡。</p></div><i class="pi pi-heart-fill" /></div>

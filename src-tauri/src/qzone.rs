@@ -43,11 +43,17 @@ fn feed_retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
 }
 
-fn sec_ch_ua(user_agent: &str) -> &'static str {
-    if user_agent.contains("Chrome") {
-        "\"Not(A:Brand\";v=\"99\", \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\""
+fn sec_ch_ua(user_agent: &str) -> String {
+    if let Some(start) = user_agent.find("Chrome/") {
+        let version_start = start + 7;
+        let major = user_agent[version_start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>();
+        let version = if major.is_empty() { "131" } else { &major };
+        format!("\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"{version}\", \"Microsoft Edge\";v=\"{version}\"")
     } else {
-        "\"Not(A:Brand\";v=\"99\", \"Apple\";v=\"0\", \"Safari\";v=\"18\""
+        "\"Not;A=Brand\";v=\"8\", \"Apple\";v=\"0\", \"Safari\";v=\"18\"".to_owned()
     }
 }
 
@@ -106,7 +112,7 @@ fn log_feed_request_error(
             "headers": {
                 "Accept": "application/json",
                 "Accept-Encoding": "gzip, deflate, br",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
                 "Cache-Control": "no-cache",
                 "Pragma": "no-cache",
                 "Origin": "https://h5.qzone.qq.com",
@@ -244,7 +250,7 @@ async fn fetch_feeds_with_attempts(
         match client
             .get(FEEDS_URL)
             .header(ACCEPT, "application/json")
-            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8")
+            .header(ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5")
             .header(CACHE_CONTROL, "no-cache")
             .header(PRAGMA, "no-cache")
             .header(ORIGIN, "https://h5.qzone.qq.com")

@@ -1087,7 +1087,7 @@ pub async fn load_archived_image(
                     reqwest::header::ACCEPT,
                     "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }
@@ -1233,7 +1233,7 @@ pub async fn load_archived_video(
                     reqwest::header::ACCEPT,
                     "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
                 )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
+                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
             if with_cookie {
                 request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
             }

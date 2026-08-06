@@ -153,6 +153,22 @@ fn random_hex(len: usize) -> String {
     result
 }
 
+/// 生成随机大小写字母+数字混合串，用于需要全字符集的 Cookie（如 RK）。
+fn random_alphanum(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let seed = unix_millis() ^ (USER_AGENT_SEQUENCE.load(Ordering::Relaxed) as u128);
+    let mut state = seed.wrapping_mul(0x9E37_79B9);
+    let mut result = String::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let idx = ((state >> 32) as usize) % CHARSET.len();
+        result.push(CHARSET[idx] as char);
+    }
+    result
+}
+
 fn select_mobile_user_agent(previous: Option<&str>) -> String {
     let sequence = USER_AGENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let seed = unix_millis() as usize ^ sequence.wrapping_mul(0x9E37_79B1);
@@ -270,7 +286,10 @@ fn normalized_uin(value: &str) -> String {
         .to_owned()
 }
 
-async fn fetch_login_sig(client: &Client, user_agent: &str) -> Result<String, String> {
+async fn fetch_login_sig(
+    client: &Client,
+    user_agent: &str,
+) -> Result<(String, HashMap<String, String>), String> {
     let params = [
         ("hide_title_bar", "1"),
         ("style", "22"),
@@ -295,11 +314,12 @@ async fn fetch_login_sig(client: &Client, user_agent: &str) -> Result<String, St
     if !response.status().is_success() {
         return Err(format!("xlogin 返回 HTTP {}", response.status()));
     }
-    let sig = response
-        .cookies()
-        .find(|c| c.name() == "pt_login_sig")
-        .map(|c| c.value().to_owned());
-    sig.ok_or("xlogin 响应中缺少 pt_login_sig cookie".into())
+    let mut cookies = HashMap::new();
+    merge_response_cookies(&response, &mut cookies);
+    let sig = cookies
+        .remove("pt_login_sig")
+        .ok_or("xlogin 响应中缺少 pt_login_sig cookie")?;
+    Ok((sig, cookies))
 }
 
 fn poll_login_url(text: &str) -> Option<String> {
@@ -330,14 +350,48 @@ fn login_credentials(session: &LoginSession) -> Option<LoginCredentials> {
     })
 }
 
+/// 登录成功后访问 QQ 空间 H5 首页，收集追踪 Cookie 并设置用户标识。
+async fn warmup_qzone_session(
+    client: &Client,
+    cookies: &mut HashMap<String, String>,
+    user_agent: &str,
+    uin: &str,
+) {
+    // 访问 H5 QQ 空间首页，触发服务端设置完整的追踪 Cookie
+    if let Ok(response) = client
+        .get("https://h5.qzone.qq.com/mqzone/index")
+        .header(USER_AGENT, user_agent)
+        .header(COOKIE, cookie_header(cookies))
+        .send()
+        .await
+    {
+        if response.status().is_success() || response.status().is_redirection() {
+            merge_response_cookies(&response, cookies);
+        }
+    }
+    // 用户标识 Cookie（正常浏览器由客户端 JS 设置）
+    if !cookies.contains_key("ptui_loginuin") {
+        cookies.insert("ptui_loginuin".into(), uin.to_owned());
+    }
+    cookies.entry("QZ_FE_WEBP_SUPPORT".to_owned())
+        .or_insert_with(|| "1".into());
+    cookies.entry("cpu_performance_v8".to_owned())
+        .or_insert_with(|| "0".into());
+    cookies.entry("__Q_w_s_hat_seed".to_owned())
+        .or_insert_with(|| "1".into());
+    cookies.entry("domainid".to_owned())
+        .or_insert_with(|| "5".into());
+}
+
 #[tauri::command]
 pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLoginStart, String> {
     let user_agent = state.next_mobile_user_agent().await;
-    let login_sig = fetch_login_sig(&state.client, &user_agent).await?;
+    let (login_sig, mut cookies) = fetch_login_sig(&state.client, &user_agent).await?;
     let response = state
         .client
         .get("https://ssl.ptlogin2.qq.com/ptqrshow")
         .header(USER_AGENT, &user_agent)
+        .header(COOKIE, cookie_header(&cookies))
         .query(&[
             ("appid", APP_ID),
             ("e", "2"),
@@ -361,15 +415,53 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         .find(|cookie| cookie.name() == "qrsig")
         .map(|cookie| cookie.value().to_owned())
         .ok_or("二维码响应中缺少 qrsig")?;
-    let mut cookies = HashMap::new();
     merge_response_cookies(&response, &mut cookies);
     // 移动端指纹 Cookie（模拟手机 QQ 浏览器）
     cookies.insert("_qimei_fingerprint".into(), random_hex(32));
     cookies.insert("_qimei_uuid42".into(), random_hex(42));
+    cookies.insert("_qimei_i_3".into(), random_hex(87));
+    cookies.insert("_qimei_h38".into(), format!("{}0{}", random_hex(25), random_hex(12)));
+    cookies.insert("_qimei_i_1".into(), random_hex(97));
     cookies.insert(
         "_qpsvr_localtk".into(),
         format!("{:.16}", unix_millis() as f64 / 1e18),
     );
+    // 浏览器追踪 Cookie（优先使用服务端返回值，仅作 fallback）
+    cookies.entry("RK".to_owned())
+        .or_insert_with(|| random_alphanum(10));
+    cookies.entry("ptcz".to_owned())
+        .or_insert_with(|| random_hex(64));
+    let ts = unix_millis();
+    cookies.entry("pgv_pvid".to_owned())
+        .or_insert_with(|| format!("{}", ts % 9_000_000_000 + 1_000_000_000));
+    cookies.entry("pgv_info".to_owned())
+        .or_insert_with(|| format!("ssid=s{}", ts));
+    cookies.entry("QZ_FE_WEBP_SUPPORT".to_owned())
+        .or_insert_with(|| "1".into());
+    cookies.entry("cpu_performance_v8".to_owned())
+        .or_insert_with(|| "0".into());
+    cookies.entry("__Q_w_s_hat_seed".to_owned())
+        .or_insert_with(|| "1".into());
+    cookies.entry("domainid".to_owned())
+        .or_insert_with(|| "5".into());
+    cookies.entry("fqm_pvqid".to_owned())
+        .or_insert_with(|| format!(
+            "{}-{}-{}-{}-{}",
+            random_hex(8),
+            random_hex(4),
+            random_hex(4),
+            random_hex(4),
+            random_hex(12)
+        ));
+    cookies.entry("fqm_sessionid".to_owned())
+        .or_insert_with(|| format!(
+            "{}-{}-{}-{}-{}",
+            random_hex(8),
+            random_hex(4),
+            random_hex(4),
+            random_hex(4),
+            random_hex(12)
+        ));
     let image = response
         .bytes()
         .await
@@ -485,6 +577,9 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
     session.g_tk = Some(bkn(p_skey));
     session.uin = Some(uin.clone());
     session.user_agent = account_user_agent(&uin);
+    // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
+    let warmup_ua = session.user_agent.clone();
+    warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
     let auth = login_credentials(session).ok_or("登录凭证不完整")?;
     Ok(LoginStatus {
         status: "success",
@@ -613,11 +708,15 @@ pub async fn check_web_login(
 
     let g_tk = bkn(&p_skey);
     let user_agent = account_user_agent(&uin);
+    let normalized = normalized_uin(&uin);
+
+    // 预热：访问 H5 QQ 空间首页，收集完整的追踪 Cookie
+    warmup_qzone_session(&state.client, &mut cookie_map, &user_agent, &normalized).await;
 
     let session = LoginSession {
         ptqrtoken: 0,
         cookies: cookie_map,
-        uin: Some(normalized_uin(&uin)),
+        uin: Some(normalized),
         g_tk: Some(g_tk),
         user_agent,
         ..Default::default()
