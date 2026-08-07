@@ -8,6 +8,11 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+website/dist
+website/.astro
+website/build
+website/.docusaurus
+website/.vitepress/cache
 dist
 dist-ssr
 *.local
@@ -30,3 +35,4 @@ bilibili-video-script.md
 douyin-video-script.md
 xiaohongshu-video-script.md
 sign-apk.bat
+.playwright-mcp
