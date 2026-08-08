@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { storeToRefs } from "pinia";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { platform } from "@tauri-apps/plugin-os";
 import Button from "primevue/button";
+import Drawer from "primevue/drawer";
 import Popover from "primevue/popover";
 import LoginDialog from "../components/LoginDialog.vue";
 import { useAppStore } from "../stores/app";
@@ -13,7 +14,9 @@ defineProps<{ pageTitle: string }>();
 const appStore = useAppStore();
 const authStore = useAuthStore();
 const router = useRouter();
+const route = useRoute();
 const accountPopover = ref<InstanceType<typeof Popover>>();
+const moreVisible = ref(false);
 const logoutLoading = ref(false);
 const { darkMode, sidebarCollapsed, themeIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
@@ -26,6 +29,9 @@ const navigation = [
   { label: "任务", icon: "pi pi-sync", to: "/tasks" },
   { label: "设置", icon: "pi pi-cog", to: "/settings" },
 ];
+const mobileNavigation = [navigation[0], navigation[1], navigation[3], navigation[4]];
+const mobileMoreNavigation = [navigation[2], navigation[5]];
+const moreActive = computed(() => mobileMoreNavigation.some((item) => item.to === route.path));
 function qzoneUrl() {
   const uin = user.value?.uin;
   if (platform() === "android") return uin ? `https://m.qzone.qq.com/${uin}` : "https://m.qzone.qq.com";
@@ -100,10 +106,22 @@ async function logout() {
       <main class="page-content"><slot /></main>
     </div>
     <nav class="mobile-navigation" aria-label="移动端导航">
-      <RouterLink v-for="item in navigation" :key="item.to" :to="item.to">
+      <RouterLink v-for="item in mobileNavigation" :key="item.to" :to="item.to">
         <i :class="item.icon" /><span>{{ item.label }}</span>
       </RouterLink>
+      <button class="mobile-navigation-item" :class="{ 'is-active': moreActive }" type="button" aria-label="打开更多页面" @click="moreVisible = true">
+        <i class="pi pi-ellipsis-h" /><span>更多</span>
+      </button>
     </nav>
+    <Drawer v-model:visible="moreVisible" position="bottom" header="更多" class="mobile-more-drawer">
+      <nav class="mobile-more-navigation" aria-label="更多页面">
+        <RouterLink v-for="item in mobileMoreNavigation" :key="item.to" :to="item.to" @click="moreVisible = false">
+          <span class="mobile-more-icon"><i :class="item.icon" /></span>
+          <span><strong>{{ item.label }}</strong><small>{{ item.to === '/contacts' ? '查看与你互动过的联系人' : '归档频率、主题与数据管理' }}</small></span>
+          <i class="pi pi-angle-right" />
+        </RouterLink>
+      </nav>
+    </Drawer>
     <LoginDialog />
   </div>
 </template>
