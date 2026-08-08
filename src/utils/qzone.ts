@@ -28,7 +28,7 @@ export interface ArchiveItem {
   comments: ArchiveComment[];
 }
 export interface LikeUser { uin?: string; nickname?: string; }
-export interface ArchiveReply { uin?: string; nickname?: string; content: string; createdAt: number; }
+export interface ArchiveReply { uin?: string; nickname?: string; replyToUin?: string; replyToNickname?: string; content: string; createdAt: number; }
 export interface ArchiveComment { uin?: string; nickname?: string; content: string; createdAt: number; replies: ArchiveReply[]; }
 export type ArchiveCategory = "self" | "other" | "guestbook";
 export interface ArchiveMediaItem { key: string; dynamicId: number; mediaType: "photo" | "video"; pictureIndex?: number; url: string; coverUrl?: string; publishedAt: number; authorUin?: string; authorName?: string; content?: string; }

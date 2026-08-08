@@ -82,6 +82,8 @@ pub struct ArchiveItem {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveComment {
+    #[serde(skip)]
+    comment_id: Option<String>,
     uin: Option<String>,
     nickname: Option<String>,
     content: String,
@@ -94,6 +96,8 @@ pub struct ArchiveComment {
 pub struct ArchiveReply {
     uin: Option<String>,
     nickname: Option<String>,
+    reply_to_uin: Option<String>,
+    reply_to_nickname: Option<String>,
     content: String,
     created_at: i64,
 }
@@ -1860,7 +1864,7 @@ pub async fn list_archived_feeds(
                 ))
             })
             .map_err(|error| format!("查询动态评论失败：{error}"))?;
-        item.comments = comments.filter_map(Result::ok).collect();
+        item.comments = merge_comments(comments.filter_map(Result::ok));
     }
     drop(comment_statement);
     let mut like_statement = connection
@@ -1998,7 +2002,7 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = comments
+    item.comments = merge_comments(comments
         .query_map(params![item.owner_uin, item.cell_id], |row| {
             Ok(comment_from_values(
                 row.get(0)?,
@@ -2009,8 +2013,7 @@ pub async fn get_archived_feed(
             ))
         })
         .map_err(|error| format!("查询动态评论失败：{error}"))?
-        .filter_map(Result::ok)
-        .collect();
+        .filter_map(Result::ok));
     drop(comments);
     let mut likes_stmt = connection
         .prepare(
@@ -2040,28 +2043,90 @@ fn comment_from_values(
 ) -> ArchiveComment {
     let value = json.and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let main = value.as_ref().and_then(|value| value.get("main_comment"));
-    let replies = main
+    let comment_id = main.and_then(|value| text_at(value, "/commentid"));
+    let main_uin = main.and_then(|value| text_at(value, "/user/uin"));
+    let main_name = main.and_then(|value| text_at(value, "/user/nickname"));
+    let main_content = main.and_then(|value| text_at(value, "/content"));
+    let main_time = main
+        .and_then(|value| value.get("date"))
+        .and_then(Value::as_i64)
+        .unwrap_or(fallback_time);
+    let mut replies: Vec<ArchiveReply> = main
         .and_then(|value| value.get("replys"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(reply_from_value)
         .collect();
+    if let Some(comment_id) = comment_id.as_deref() {
+        let related_replies = value
+            .as_ref()
+            .and_then(|value| value.get("comments"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|comment| text_at(comment, "/commentid").as_deref() == Some(comment_id))
+            .filter_map(|comment| comment.get("replys"))
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(reply_from_value);
+        for reply in related_replies {
+            let duplicate = replies.iter().any(|candidate| {
+                candidate.uin == reply.uin
+                    && candidate.content == reply.content
+                    && candidate.created_at == reply.created_at
+            });
+            if !duplicate {
+                replies.push(reply);
+            }
+        }
+    }
+
+    // Reply notifications keep the parent in main_comment but put the actual
+    // reply text and author at the feed level. When the parent author replies
+    // again, target the latest preceding reply from the other participant.
+    let is_reply_notification = main
+        .and_then(|value| value.get("replynum"))
+        .and_then(Value::as_i64)
+        .is_some_and(|count| count > 0)
+        && main_uin.is_some()
+        && fallback_uin.is_some()
+        && main_content.as_deref() != fallback_content.as_deref()
+        && fallback_time > main_time;
+    if is_reply_notification {
+        if let Some(content) = fallback_content.clone() {
+            let duplicate = replies
+                .iter()
+                .any(|reply| reply.uin == fallback_uin && reply.content == content);
+            if !duplicate {
+                let reply_target = replies
+                    .iter()
+                    .filter(|reply| reply.uin != fallback_uin && reply.created_at <= fallback_time)
+                    .max_by_key(|reply| reply.created_at);
+                replies.push(ArchiveReply {
+                    uin: fallback_uin.clone(),
+                    nickname: fallback_name.clone(),
+                    reply_to_uin: reply_target
+                        .and_then(|reply| reply.uin.clone())
+                        .or_else(|| main_uin.clone()),
+                    reply_to_nickname: reply_target
+                        .and_then(|reply| reply.nickname.clone())
+                        .or_else(|| main_name.clone()),
+                    content,
+                    created_at: fallback_time,
+                });
+            }
+        }
+    }
+
     ArchiveComment {
-        uin: main
-            .and_then(|value| text_at(value, "/user/uin"))
-            .or(fallback_uin),
-        nickname: main
-            .and_then(|value| text_at(value, "/user/nickname"))
-            .or(fallback_name),
-        content: main
-            .and_then(|value| text_at(value, "/content"))
+        comment_id,
+        uin: main_uin.or(fallback_uin),
+        nickname: main_name.or(fallback_name),
+        content: main_content
             .or(fallback_content)
             .unwrap_or_else(|| "评论了这条动态".into()),
-        created_at: main
-            .and_then(|value| value.get("date"))
-            .and_then(Value::as_i64)
-            .unwrap_or(fallback_time),
+        created_at: main_time,
         replies,
     }
 }
@@ -2072,9 +2137,44 @@ fn reply_from_value(value: &Value) -> Option<ArchiveReply> {
         uin: text_at(value, "/user/uin").or_else(|| text_at(value, "/replyuser/uin")),
         nickname: text_at(value, "/user/nickname")
             .or_else(|| text_at(value, "/replyuser/nickname")),
+        reply_to_uin: text_at(value, "/replyuser/uin")
+            .or_else(|| text_at(value, "/targetuser/uin"))
+            .or_else(|| text_at(value, "/target/uin")),
+        reply_to_nickname: text_at(value, "/replyuser/nickname")
+            .or_else(|| text_at(value, "/targetuser/nickname"))
+            .or_else(|| text_at(value, "/target/nickname")),
         content,
         created_at: value.get("date").and_then(Value::as_i64).unwrap_or(0),
     })
+}
+
+fn merge_comments(comments: impl IntoIterator<Item = ArchiveComment>) -> Vec<ArchiveComment> {
+    let mut merged: Vec<ArchiveComment> = Vec::new();
+    for mut comment in comments {
+        let existing = merged.iter_mut().find(|candidate| {
+            (comment.comment_id.is_some() && candidate.comment_id == comment.comment_id)
+                || (candidate.uin == comment.uin
+                    && candidate.content == comment.content
+                    && candidate.created_at == comment.created_at)
+        });
+        if let Some(existing) = existing {
+            for reply in comment.replies.drain(..) {
+                let duplicate = existing.replies.iter().any(|candidate| {
+                    candidate.uin == reply.uin
+                        && candidate.content == reply.content
+                        && candidate.created_at == reply.created_at
+                });
+                if !duplicate {
+                    existing.replies.push(reply);
+                }
+            }
+            existing.replies.sort_by_key(|reply| reply.created_at);
+        } else {
+            comment.replies.sort_by_key(|reply| reply.created_at);
+            merged.push(comment);
+        }
+    }
+    merged
 }
 
 fn validate_category(category: &str) -> Result<(), String> {
@@ -2180,7 +2280,7 @@ fn archive_items_for_export(
                 ))
             })
             .map_err(|error| format!("查询导出评论失败：{error}"))?;
-        item.comments = rows.filter_map(Result::ok).collect();
+        item.comments = merge_comments(rows.filter_map(Result::ok));
     }
     drop(comments);
     let mut export_likes = connection
@@ -2298,28 +2398,38 @@ pub async fn export_archived_html(
         if !item.comments.is_empty() {
             cards.push_str("<section class=\"comments\">");
             for comment in &item.comments {
-                cards.push_str("<div class=\"comment\"><b>");
-                cards.push_str(&html_escape(
-                    comment
-                        .nickname
-                        .as_deref()
-                        .or(comment.uin.as_deref())
-                        .unwrap_or("QQ 用户"),
-                ));
-                cards.push_str("</b> ");
+                let comment_name = comment
+                    .nickname
+                    .as_deref()
+                    .or(comment.uin.as_deref())
+                    .unwrap_or("QQ 用户");
+                cards.push_str("<div class=\"comment\"><div class=\"comment-meta\"><b>");
+                cards.push_str(&html_escape(comment_name));
+                cards.push_str("</b> 评论于 <time data-time=\"");
+                cards.push_str(&comment.created_at.to_string());
+                cards.push_str("\"></time></div>");
                 cards.push_str(&qzone_text_html(Some(&comment.content)));
                 if !comment.replies.is_empty() {
                     cards.push_str("<div class=\"replies\">");
                     for reply in &comment.replies {
-                        cards.push_str("<div><b>");
+                        let reply_name = reply
+                            .nickname
+                            .as_deref()
+                            .or(reply.uin.as_deref())
+                            .unwrap_or("QQ 用户");
+                        cards.push_str("<div><div class=\"comment-meta\"><b>");
+                        cards.push_str(&html_escape(reply_name));
+                        cards.push_str("</b> 回复 ");
                         cards.push_str(&html_escape(
                             reply
-                                .nickname
+                                .reply_to_nickname
                                 .as_deref()
-                                .or(reply.uin.as_deref())
-                                .unwrap_or("QQ 用户"),
+                                .or(reply.reply_to_uin.as_deref())
+                                .unwrap_or(comment_name),
                         ));
-                        cards.push_str("</b> ");
+                        cards.push_str(" · <time data-time=\"");
+                        cards.push_str(&reply.created_at.to_string());
+                        cards.push_str("\"></time></div>");
                         cards.push_str(&qzone_text_html(Some(&reply.content)));
                         cards.push_str("</div>");
                     }
@@ -2332,7 +2442,7 @@ pub async fn export_archived_html(
         cards.push_str("</article>");
     }
     Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
         owner = html_escape(&owner_uin),
         count = items.len()
     ))
@@ -2598,9 +2708,9 @@ pub async fn list_interactors(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, parse_feed,
-        parse_feed_cursor, serialize_query_pairs, skip_probe_offsets, ArchiveCheckpoint,
-        FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, comment_from_values,
+        merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs, skip_probe_offsets,
+        ArchiveCheckpoint, FeedCursorDetails,
     };
     use serde_json::json;
 
@@ -2626,6 +2736,211 @@ mod tests {
         assert_eq!(parsed.event_type, 2);
         assert_eq!(parsed.picture_count, 2);
         assert!(parsed.comments_json.is_some());
+    }
+
+    #[test]
+    fn nests_feed_level_reply_under_its_parent_comment() {
+        let comments = json!({
+            "main_comment": {
+                "content": "给我我好想要",
+                "date": 1785795539_i64,
+                "replynum": 1,
+                "replys": null,
+                "user": { "uin": "718038005", "nickname": "此刻春和景明_" }
+            }
+        });
+
+        let comment = comment_from_values(
+            Some(comments.to_string()),
+            Some("1027704977".into()),
+            Some("轻鹄".into()),
+            Some("[em]e10324[/em]".into()),
+            1785807754,
+        );
+
+        assert_eq!(comment.content, "给我我好想要");
+        assert_eq!(comment.replies.len(), 1);
+        assert_eq!(comment.replies[0].nickname.as_deref(), Some("轻鹄"));
+        assert_eq!(comment.replies[0].content, "[em]e10324[/em]");
+        assert_eq!(comment.replies[0].created_at, 1785807754);
+    }
+
+    #[test]
+    fn does_not_turn_a_regular_comment_into_its_own_reply() {
+        let comments = json!({
+            "main_comment": {
+                "content": "入才",
+                "date": 1743068483_i64,
+                "replynum": 0,
+                "replys": null,
+                "user": { "uin": "1027704977", "nickname": "轻鹄" }
+            }
+        });
+
+        let comment = comment_from_values(
+            Some(comments.to_string()),
+            Some("1027704977".into()),
+            Some("轻鹄".into()),
+            Some("入才".into()),
+            1743068483,
+        );
+
+        assert!(comment.replies.is_empty());
+    }
+
+    #[test]
+    fn merges_multi_round_replies_and_preserves_each_target() {
+        let first = json!({
+            "main_comment": {
+                "commentid": "parent-1",
+                "content": "父评论",
+                "date": 100_i64,
+                "replynum": 1,
+                "replys": [{
+                    "content": "第一轮",
+                    "date": 110_i64,
+                    "user": { "uin": "2", "nickname": "乙" },
+                    "replyuser": { "uin": "1", "nickname": "甲" }
+                }],
+                "user": { "uin": "1", "nickname": "甲" }
+            }
+        });
+        let second = json!({
+            "main_comment": {
+                "commentid": "parent-1",
+                "content": "父评论",
+                "date": 100_i64,
+                "replynum": 1,
+                "replys": [{
+                    "content": "第二轮",
+                    "date": 120_i64,
+                    "user": { "uin": "1", "nickname": "甲" },
+                    "replyuser": { "uin": "2", "nickname": "乙" }
+                }],
+                "user": { "uin": "1", "nickname": "甲" }
+            }
+        });
+
+        let comments = merge_comments([
+            comment_from_values(Some(first.to_string()), None, None, None, 0),
+            comment_from_values(Some(second.to_string()), None, None, None, 0),
+        ]);
+
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].replies.len(), 2);
+        assert_eq!(comments[0].replies[0].nickname.as_deref(), Some("乙"));
+        assert_eq!(
+            comments[0].replies[0].reply_to_nickname.as_deref(),
+            Some("甲")
+        );
+        assert_eq!(comments[0].replies[1].nickname.as_deref(), Some("甲"));
+        assert_eq!(
+            comments[0].replies[1].reply_to_nickname.as_deref(),
+            Some("乙")
+        );
+        assert_eq!(comments[0].replies[1].created_at, 120);
+    }
+
+    #[test]
+    fn includes_owner_reply_stored_in_comments_array() {
+        let comments = json!({
+            "comments": [{
+                "commentid": "1",
+                "content": "嘎嘎咕咕",
+                "date": 1786197473_i64,
+                "user": { "uin": "1027704977", "nickname": "轻鹄" },
+                "replys": [{
+                    "replyid": "1",
+                    "content": "咕咕咕咕嘎嘎",
+                    "date": 1786197525_i64,
+                    "user": { "uin": "718038005", "nickname": "此刻春和景明_" },
+                    "target": { "uin": "1027704977", "nickname": "轻鹄" }
+                }]
+            }],
+            "main_comment": {
+                "commentid": "1",
+                "content": "嘎嘎咕咕",
+                "date": 1786197473_i64,
+                "replynum": 1,
+                "replys": null,
+                "user": { "uin": "1027704977", "nickname": "轻鹄" }
+            }
+        });
+
+        let comment = comment_from_values(
+            Some(comments.to_string()),
+            Some("1027704977".into()),
+            Some("轻鹄".into()),
+            Some("嘎嘎咕咕".into()),
+            1786197473,
+        );
+
+        assert_eq!(comment.content, "嘎嘎咕咕");
+        assert_eq!(comment.replies.len(), 1);
+        assert_eq!(
+            comment.replies[0].nickname.as_deref(),
+            Some("此刻春和景明_")
+        );
+        assert_eq!(comment.replies[0].content, "咕咕咕咕嘎嘎");
+        assert_eq!(
+            comment.replies[0].reply_to_nickname.as_deref(),
+            Some("轻鹄")
+        );
+        assert_eq!(comment.replies[0].created_at, 1786197525);
+    }
+
+    #[test]
+    fn attaches_parent_author_follow_up_to_latest_child_reply() {
+        let comments = json!({
+            "comments": [{
+                "commentid": "1",
+                "content": "嘎嘎咕咕",
+                "date": 1786197473_i64,
+                "user": { "uin": "1027704977", "nickname": "轻鹄" },
+                "replys": [
+                    {
+                        "replyid": "2",
+                        "content": "咕咕嘎嘎咕咕嘎嘎",
+                        "date": 1786199046_i64,
+                        "user": { "uin": "718038005", "nickname": "此刻春和景明_" },
+                        "target": { "uin": "1027704977", "nickname": "轻鹄" }
+                    },
+                    {
+                        "replyid": "3",
+                        "content": "凑凑凑凑凑企鹅",
+                        "date": 1786199059_i64,
+                        "user": { "uin": "718038005", "nickname": "此刻春和景明_" },
+                        "target": { "uin": "1027704977", "nickname": "轻鹄" }
+                    }
+                ]
+            }],
+            "main_comment": {
+                "commentid": "1",
+                "content": "嘎嘎咕咕",
+                "date": 1786197473_i64,
+                "replynum": 4,
+                "replys": null,
+                "user": { "uin": "1027704977", "nickname": "轻鹄" }
+            }
+        });
+
+        let comment = comment_from_values(
+            Some(comments.to_string()),
+            Some("1027704977".into()),
+            Some("轻鹄".into()),
+            Some("人才咕嘎咕嘎".into()),
+            1786199104,
+        );
+
+        assert_eq!(comment.replies.len(), 3);
+        let follow_up = &comment.replies[2];
+        assert_eq!(follow_up.nickname.as_deref(), Some("轻鹄"));
+        assert_eq!(follow_up.content, "人才咕嘎咕嘎");
+        assert_eq!(
+            follow_up.reply_to_nickname.as_deref(),
+            Some("此刻春和景明_")
+        );
+        assert_eq!(follow_up.created_at, 1786199104);
     }
 
     #[test]

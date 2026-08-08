@@ -322,11 +322,11 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
         <section v-if="item.comments.length" class="archive-comments">
           <div v-for="comment in (expandedComments.has(item.id) ? item.comments : item.comments.slice(0, 3))" :key="`${comment.uin}-${comment.createdAt}-${comment.content}`" class="archive-comment">
             <span class="comment-avatar"><img v-if="comment.uin" :src="avatarUrl(comment.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-            <div class="archive-comment-body"><p><strong>{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><QzoneText :value="comment.content" /></p><time>{{ formatTime(comment.createdAt) }}</time>
+            <div class="archive-comment-body"><div class="archive-comment-meta"><strong>{{ comment.nickname || comment.uin || "QQ 用户" }}</strong><span>评论于</span><time>{{ formatTime(comment.createdAt) }}</time></div><p><QzoneText :value="comment.content" /></p>
               <div v-if="comment.replies.length" class="archive-comment-replies">
                 <div v-for="(reply, replyIndex) in comment.replies" :key="`${reply.uin}-${reply.createdAt}-${replyIndex}`" class="archive-reply">
                   <span class="reply-avatar"><img v-if="reply.uin" :src="avatarUrl(reply.uin)" loading="lazy" referrerpolicy="no-referrer" /><i v-else class="pi pi-user" /></span>
-                  <div><p><strong>{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><QzoneText :value="reply.content" /></p><time>{{ formatTime(reply.createdAt) }}</time></div>
+                  <div><div class="archive-comment-meta"><strong>{{ reply.nickname || reply.uin || "QQ 用户" }}</strong><span>回复 {{ reply.replyToNickname || reply.replyToUin || comment.nickname || comment.uin || "QQ 用户" }}</span><time>{{ formatTime(reply.createdAt) }}</time></div><p><QzoneText :value="reply.content" /></p></div>
                 </div>
               </div>
             </div>
