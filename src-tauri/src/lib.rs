@@ -7,6 +7,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(archive::ArchiveState::new())
         .manage(qlogin::QLoginState::new())
+        .manage(qzone::RecycleAuthState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
@@ -22,6 +23,13 @@ pub fn run() {
             qlogin::sync_cookies_to_webview,
             qzone::fetch_first_feeds,
             qzone::fetch_more_feeds,
+            qzone::open_recycle_password_window,
+            qzone::check_recycle_password,
+            qzone::close_recycle_password_window,
+            qzone::list_recycle_albums,
+            qzone::list_recycle_photos,
+            qzone::load_recycle_photo_preview,
+            qzone::recover_recycle_photos,
             archive::start_feed_archive,
             archive::get_archive_progress,
             archive::cancel_feed_archive,

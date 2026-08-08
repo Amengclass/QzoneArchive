@@ -54,3 +54,12 @@ export const getInteractionRanking = (limit = 8) => invoke<InteractionRank[]>("g
 export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_archived_feeds", { ids });
 export const clearArchivedFeeds = () => invoke<number>("clear_archived_feeds");
 export const deleteAllAppData = () => invoke<void>("delete_all_app_data");
+
+export const openRecyclePasswordWindow = () => invoke<void>("open_recycle_password_window");
+export const checkRecyclePassword = () => invoke<string | null>("check_recycle_password");
+export const closeRecyclePasswordWindow = () => invoke<void>("close_recycle_password_window");
+export const listRecycleAlbums = (pwd2sig: string) => invoke<Record<string, unknown>>("list_recycle_albums", { pwd2sig });
+export const listRecyclePhotos = (pwd2sig: string, albumId?: string) => invoke<Record<string, unknown>>("list_recycle_photos", { pwd2sig, albumId });
+export const recoverRecyclePhotos = (pwd2sig: string, sourceAlbumId: string, targetAlbumId: string, photoIds: string[]) =>
+  invoke<Record<string, unknown>>("recover_recycle_photos", { pwd2sig, sourceAlbumId, targetAlbumId, photoIds });
+export const loadRecyclePhotoPreview = (imageUrl: string) => invoke<string>("load_recycle_photo_preview", { imageUrl });
