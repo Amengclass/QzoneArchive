@@ -19,6 +19,12 @@ const RECYCLE_PHOTO_LIST_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_plist_recycle_v2";
 const RECOVER_PHOTO_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_recover_pic_v2";
+const RECOVER_ALBUM_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_recover_album_v2";
+const ALBUM_LIST_URL: &str =
+    "https://h5.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3";
+const CREATE_ALBUM_URL: &str =
+    "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_add_album_v2";
 
 #[derive(Clone, Default)]
 pub struct RecycleAuthState {
@@ -98,13 +104,28 @@ fn parse_qzone_json(text: &str) -> Result<Value, String> {
     // a callback such as `cb({...})`. Try candidate object spans from the end
     // so setup blocks like `try { document.domain = ... }` are ignored.
     let starts: Vec<usize> = normalized.match_indices('{').map(|(index, _)| index).collect();
+    let mut best_with_code: Option<(usize, Value)> = None;
+    let mut fallback: Option<Value> = None;
     for &start in starts.iter().rev() {
         let ends: Vec<usize> = normalized[start..].match_indices('}').map(|(index, _)| start + index + 1).collect();
         for &end in ends.iter().rev().take(80) {
             if let Ok(value) = serde_json::from_str::<Value>(&normalized[start..end]) {
-                return Ok(value);
+                let span = end - start;
+                if value.get("code").is_some()
+                    && best_with_code.as_ref().map_or(true, |(best_span, _)| span > *best_span)
+                {
+                    best_with_code = Some((span, value));
+                } else if fallback.is_none() {
+                    fallback = Some(value);
+                }
             }
         }
+    }
+    if let Some((_, value)) = best_with_code {
+        return Ok(value);
+    }
+    if let Some(value) = fallback {
+        return Ok(value);
     }
     Err(format!("解析 QQ 空间响应失败：响应片段：{}", normalized.chars().take(180).collect::<String>()))
 }
@@ -117,10 +138,10 @@ fn parse_qzone_action_response(text: &str) -> Result<Value, String> {
 }
 
 fn ensure_qzone_success(value: Value) -> Result<Value, String> {
-    let code = value
-        .get("code")
-        .and_then(Value::as_i64)
-        .ok_or("QQ 空间响应缺少 code 字段")?;
+    let code = value.get("code").and_then(|code| {
+        code.as_i64()
+            .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
+    }).ok_or("QQ 空间响应缺少 code 字段")?;
     if code == 0 {
         return Ok(value);
     }
@@ -476,6 +497,191 @@ pub async fn load_recycle_photo_preview(
 }
 
 #[tauri::command]
+pub async fn list_qzone_albums(state: tauri::State<'_, QLoginState>) -> Result<Value, String> {
+    let auth = state.qzone_auth().await?;
+    let request_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .rem_euclid(1_000_000_000)
+        .to_string();
+    let query = vec![
+        ("g_tk", auth.g_tk.to_string()),
+        ("t", request_id),
+        ("hostUin", auth.uin.clone()),
+        ("uin", auth.uin.clone()),
+        ("appid", "4".into()),
+        ("inCharset", "utf-8".into()),
+        ("outCharset", "utf-8".into()),
+        ("source", "qzone".into()),
+        ("plat", "qzone".into()),
+        ("format", "jsonp".into()),
+        ("notice", "0".into()),
+        ("mode", "2".into()),
+        ("sortOrder", "4".into()),
+        ("pageStart", "0".into()),
+        ("pageNum", "1000".into()),
+        ("idcNum", "4".into()),
+        ("callbackFun", "shine0".into()),
+    ];
+    let response = state
+        .client()
+        .get(ALBUM_LIST_URL)
+        .query(&query)
+        .header(ACCEPT, "application/json, text/javascript, */*; q=0.01")
+        .header(REFERER, "https://user.qzone.qq.com/")
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|error| format!("获取相册列表失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取相册列表响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("获取相册列表失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_json(&text)?)
+}
+
+#[tauri::command]
+pub async fn create_qzone_album(
+    state: tauri::State<'_, QLoginState>,
+    name: String,
+) -> Result<Value, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("相册名称不能为空".into());
+    }
+    if name.chars().count() > 30 {
+        return Err("相册名称不能超过 30 个字符".into());
+    }
+    let auth = state.qzone_auth().await?;
+    let form = [
+        ("album_type", ""),
+        ("birth_time", ""),
+        ("degree_type", "0"),
+        ("enroll_time", ""),
+        ("albumname", name),
+        ("albumdesc", ""),
+        ("albumclass", "100"),
+        ("priv", "1"),
+        ("question", ""),
+        ("answer", ""),
+        ("whiteList", ""),
+        ("bitmap", "10000000"),
+        ("uin", auth.uin.as_str()),
+        ("hostUin", auth.uin.as_str()),
+        ("format", "fs"),
+        ("inCharset", "utf-8"),
+        ("outCharset", "utf-8"),
+        ("notice", "0"),
+        ("callbackFun", "_Callback"),
+        ("plat", "qzone"),
+        ("source", "qzone"),
+        ("appid", "4"),
+    ];
+    let response = state
+        .client()
+        .post(CREATE_ALBUM_URL)
+        .query(&[("g_tk", auth.g_tk.to_string())])
+        .header(
+            REFERER,
+            format!("https://user.qzone.qq.com/{}/photo", auth.uin),
+        )
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .header(ORIGIN, "https://user.qzone.qq.com")
+        .header(
+            "content-type",
+            "application/x-www-form-urlencoded;charset=UTF-8",
+        )
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| format!("创建相册失败：{error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取创建相册响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("创建相册失败：HTTP {status}"));
+    }
+    ensure_qzone_success(parse_qzone_action_response(&text)?)
+}
+
+#[tauri::command]
+pub async fn recover_recycle_album(
+    state: tauri::State<'_, QLoginState>,
+    pwd2sig: String,
+    album_id: String,
+) -> Result<Value, String> {
+    if pwd2sig.trim().is_empty() {
+        return Err("独立密码验证已失效，请重新验证".into());
+    }
+    if album_id.trim().is_empty() {
+        return Err("缺少回收站相册 ID".into());
+    }
+    let auth = state.qzone_auth().await?;
+    let qzreferrer = format!("https://user.qzone.qq.com/{}", auth.uin);
+    let form = [
+        ("inCharset", "utf-8"),
+        ("outCharset", "utf-8"),
+        ("hostUin", auth.uin.as_str()),
+        ("notice", "0"),
+        ("callbackFun", "_Callback"),
+        ("format", "fs"),
+        ("plat", "qzone"),
+        ("source", "qzone"),
+        ("appid", "4"),
+        ("uin", auth.uin.as_str()),
+        ("albumId", album_id.as_str()),
+        ("pwd2sig", pwd2sig.as_str()),
+        ("qzreferrer", qzreferrer.as_str()),
+    ];
+    let response = state
+        .client()
+        .post(RECOVER_ALBUM_URL)
+        .query(&[("g_tk", auth.g_tk.to_string())])
+        .header(ACCEPT, "*/*")
+        .header(
+            ACCEPT_LANGUAGE,
+            "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+        )
+        .header(CACHE_CONTROL, "no-cache")
+        .header(PRAGMA, "no-cache")
+        .header(ORIGIN, "https://user.qzone.qq.com")
+        .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
+        .header(USER_AGENT, &auth.user_agent)
+        .header(COOKIE, &auth.cookie_header)
+        .header("priority", "u=1, i")
+        .header("sec-fetch-dest", "empty")
+        .header("sec-fetch-mode", "cors")
+        .header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| format!("恢复相册失败：{error}"))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|error| format!("读取恢复相册响应失败：{error}"))?;
+    if !status.is_success() {
+        return Err(format!("恢复相册失败：HTTP {status}"));
+    }
+    let parsed = ensure_qzone_success(parse_qzone_action_response(&text)?)?;
+    let data = parsed.get("data").cloned().unwrap_or_default();
+    let succeeded = data.get("succ_num").and_then(Value::as_u64).unwrap_or(0);
+    let failed = data.get("fail_num").and_then(Value::as_u64).unwrap_or(0);
+    if succeeded != 1 || failed != 0 {
+        return Err(format!("相册恢复未完成：成功 {succeeded} 个，失败 {failed} 个"));
+    }
+    Ok(parsed)
+}
+
+#[tauri::command]
 pub async fn recover_recycle_photos(
     state: tauri::State<'_, QLoginState>,
     pwd2sig: String,
@@ -513,10 +719,21 @@ pub async fn recover_recycle_photos(
         .client()
         .post(RECOVER_PHOTO_URL)
         .query(&[("g_tk", g_tk.as_str())])
+        .header(ACCEPT, "*/*")
+        .header(
+            ACCEPT_LANGUAGE,
+            "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+        )
+        .header(CACHE_CONTROL, "no-cache")
+        .header(PRAGMA, "no-cache")
         .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
         .header(USER_AGENT, &auth.user_agent)
         .header(COOKIE, &auth.cookie_header)
-        .header("origin", "https://user.qzone.qq.com")
+        .header(ORIGIN, "https://user.qzone.qq.com")
+        .header("priority", "u=1, i")
+        .header("sec-fetch-dest", "empty")
+        .header("sec-fetch-mode", "cors")
+        .header("sec-fetch-site", "same-origin")
         .header("content-type", "application/x-www-form-urlencoded;charset=UTF-8")
         .form(&form)
         .send()
@@ -528,7 +745,25 @@ pub async fn recover_recycle_photos(
         let detail = text.chars().take(300).collect::<String>();
         return Err(format!("恢复照片失败：HTTP {status} {detail}"));
     }
-    ensure_qzone_success(parse_qzone_action_response(&text)?)
+    let parsed = ensure_qzone_success(parse_qzone_action_response(&text)?)?;
+    if let Some(succeeded) = parsed
+        .get("data")
+        .and_then(|data| data.get("succ_num"))
+        .and_then(Value::as_u64)
+    {
+        let expected = photo_ids.len() as u64;
+        if succeeded != expected {
+            let failed = parsed
+                .get("data")
+                .and_then(|data| data.get("fail_num"))
+                .and_then(Value::as_u64)
+                .unwrap_or(expected.saturating_sub(succeeded));
+            return Err(format!(
+                "照片恢复未完成：请求 {expected} 张，成功 {succeeded} 张，失败 {failed} 张"
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<String> {
@@ -1030,6 +1265,16 @@ mod tests {
         assert_eq!(value["code"], 0);
         assert_eq!(value["data"]["succ_num"], 1);
         assert!(ensure_qzone_success(value).is_ok());
+    }
+
+    #[test]
+    fn parses_outer_object_from_nested_jsonp_response() {
+        let value = parse_qzone_json(
+            r#"shine0({"code":0,"data":{"albumList":[{"id":"album-1","name":"恢复相册"}]}});"#,
+        )
+        .unwrap();
+        assert_eq!(value["code"], 0);
+        assert_eq!(value["data"]["albumList"][0]["id"], "album-1");
     }
 
     #[test]
