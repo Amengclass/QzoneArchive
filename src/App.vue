@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useRoute } from "vue-router";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import Button from "primevue/button";
 import Checkbox from "primevue/checkbox";
@@ -23,7 +24,14 @@ function acceptDisclaimer() {
   disclaimerAccepted.value = true;
   void authStore.restoreSession();
 }
-async function declineDisclaimer() { await getCurrentWindow().close(); }
+async function declineDisclaimer() {
+  try {
+    await invoke("exit_app");
+  } catch {
+    // Vite/browser preview has no native process to exit; close the window when possible.
+    try { await getCurrentWindow().close(); } catch { /* no-op */ }
+  }
+}
 </script>
 
 <template>

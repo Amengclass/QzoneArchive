@@ -2,6 +2,13 @@ mod archive;
 mod qlogin;
 mod qzone;
 
+use tauri::Manager;
+
+#[tauri::command]
+fn exit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -14,6 +21,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            exit_app,
             qlogin::start_qr_login,
             qlogin::poll_qr_login,
             qlogin::get_login_status,
