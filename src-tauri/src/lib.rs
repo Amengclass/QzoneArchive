@@ -2,8 +2,6 @@ mod archive;
 mod qlogin;
 mod qzone;
 
-use tauri::Manager;
-
 #[tauri::command]
 fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
