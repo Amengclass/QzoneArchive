@@ -9,7 +9,10 @@ import { useAuthStore } from "../stores/auth";
 
 const authStore = useAuthStore();
 const { dialogVisible, loading, qrImage, status, message, webLoginMode } = storeToRefs(authStore);
-const showWebLogin = computed(() => platform() !== "android");
+const showWebLogin = computed(() => {
+  const currentPlatform = platform();
+  return currentPlatform !== "android" && currentPlatform !== "ios";
+});
 </script>
 
 <template>

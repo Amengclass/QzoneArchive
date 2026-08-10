@@ -249,6 +249,50 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           if-no-files-found: error
 
+  # ── Linux ────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Linux bundles
+        run: npx tauri build --bundles appimage,deb
+
+      - name: Upload Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
   # ── iOS ARM64 未签名 IPA ─────────────────────────────
   ios:
     # iOS 构建只能在 macOS Runner 上执行。
@@ -288,6 +332,7 @@ jobs:
           fi
 
           pod --version
+          ruby -e 'require "xcodeproj"; puts Xcodeproj::VERSION'
 
       - name: Install frontend dependencies
         run: npm ci
@@ -314,12 +359,59 @@ jobs:
           rm -rf src-tauri/gen/apple
           npx tauri ios init --ci
 
-      - name: Add iOS privacy manifest
+      - name: Install custom iOS icons
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > src-tauri/gen/apple/PrivacyInfo.xcprivacy <<'EOF'
+          npx tauri icon \
+            src-tauri/icons/qzone-archive-icon.png \
+            --ios-color "#ffffff"
+
+          APPICONSET="$(
+            find src-tauri/gen/apple \
+              -type d \
+              -name "AppIcon.appiconset" \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$APPICONSET" ] || [ ! -d "$APPICONSET" ]; then
+            echo "Generated AppIcon.appiconset was not found."
+            exit 1
+          fi
+
+          STORE_ICON="$APPICONSET/AppIcon-512@2x.png"
+          test -f "$STORE_ICON"
+
+          # ios-color 会将源图标的透明区域铺成指定背景色。
+          # sips 的 hasAlpha 只表示 PNG 是否带 Alpha 通道，并不表示存在
+          # 透明像素，因此不能把 hasAlpha: yes 当作失败条件。
+          sips -g pixelWidth -g pixelHeight -g hasAlpha "$STORE_ICON"
+
+      - name: Configure iOS metadata and privacy manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INFO_PLIST="$(
+            find src-tauri/gen/apple \
+              -type f \
+              -name "Info.plist" \
+              ! -path "*/LaunchScreen.storyboardc/*" \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$INFO_PLIST" ] || [ ! -f "$INFO_PLIST" ]; then
+            echo "Generated application Info.plist was not found."
+            exit 1
+          fi
+
+          IOS_TARGET_DIR="$(dirname "$INFO_PLIST")"
+          PRIVACY_MANIFEST="$IOS_TARGET_DIR/PrivacyInfo.xcprivacy"
+
+          cat > "$PRIVACY_MANIFEST" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -341,7 +433,42 @@ jobs:
           </plist>
           EOF
 
-          plutil -lint src-tauri/gen/apple/PrivacyInfo.xcprivacy
+          plutil -lint "$INFO_PLIST"
+          plutil -lint "$PRIVACY_MANIFEST"
+
+          # ios init 已经生成了 xcodeproj，因此显式把 manifest 加入应用
+          # target 的 Copy Bundle Resources 阶段。
+          INFO_PLIST="$INFO_PLIST" PRIVACY_MANIFEST="$PRIVACY_MANIFEST" ruby <<'RUBY'
+          require "xcodeproj"
+
+          project_path = Dir["src-tauri/gen/apple/*.xcodeproj"].first
+          abort "Generated Xcode project was not found." unless project_path
+
+          project = Xcodeproj::Project.open(project_path)
+          target = project.targets.find do |candidate|
+            candidate.product_type == "com.apple.product-type.application"
+          end
+          abort "iOS application target was not found." unless target
+
+          info_plist = File.expand_path(ENV.fetch("INFO_PLIST"))
+          privacy_manifest = File.expand_path(ENV.fetch("PRIVACY_MANIFEST"))
+          info_ref = project.files.find do |file|
+            file.real_path.to_s == info_plist
+          end
+          abort "Info.plist file reference was not found." unless info_ref
+
+          group = info_ref.parent
+          manifest_ref = project.files.find do |file|
+            file.real_path.to_s == privacy_manifest
+          end
+          manifest_ref ||= group.new_file("PrivacyInfo.xcprivacy")
+
+          unless target.resources_build_phase.files_references.include?(manifest_ref)
+            target.resources_build_phase.add_file_reference(manifest_ref, true)
+          end
+
+          project.save
+          RUBY
 
       - name: Build unsigned iOS IPA
         shell: bash
@@ -400,6 +527,46 @@ jobs:
 
           cat dist/ios/SHA256SUMS-ios.txt
 
+      - name: Verify unsigned iOS IPA contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA_PATH="$(find dist/ios -type f -name "*.ipa" -print -quit)"
+          VERIFY_DIR="$RUNNER_TEMP/qzonearchive-ios-verify"
+
+          rm -rf "$VERIFY_DIR"
+          mkdir -p "$VERIFY_DIR"
+          ditto -x -k "$IPA_PATH" "$VERIFY_DIR"
+
+          APP_PATH="$(find "$VERIFY_DIR/Payload" -maxdepth 1 -type d -name "*.app" -print -quit)"
+          INFO_PLIST="$APP_PATH/Info.plist"
+          EXECUTABLE="$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$INFO_PLIST")"
+          DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$INFO_PLIST")"
+
+          test "$EXECUTABLE" = "qzonearchive"
+          test "$DISPLAY_NAME" = "空间归档"
+          test -f "$APP_PATH/$EXECUTABLE"
+          test -f "$APP_PATH/PrivacyInfo.xcprivacy"
+          test -f "$APP_PATH/AppIcon60x60@2x.png"
+          grep -a -q "assets/index-" "$APP_PATH/$EXECUTABLE"
+
+          # Release 中发布的必须保持未签名状态。
+          test ! -d "$APP_PATH/_CodeSignature"
+          test ! -f "$APP_PATH/embedded.mobileprovision"
+          if codesign -d "$APP_PATH" >/dev/null 2>&1; then
+            echo "Expected an unsigned iOS app, but a code signature was found."
+            exit 1
+          fi
+
+          echo "Verified unsigned IPA:"
+          echo "  executable: $EXECUTABLE"
+          echo "  display name: $DISPLAY_NAME"
+          echo "  privacy manifest: present"
+          echo "  custom icon: present"
+          echo "  embedded frontend: present"
+          echo "  code signature: absent"
+
       - name: Upload unsigned iOS IPA
         uses: actions/upload-artifact@v4
         with:
@@ -412,11 +579,8 @@ jobs:
   # ── GitHub Release ──────────────────────────────────
   publish:
     needs:
-      - windows
-      - macos-x64
-      - macos-arm64
-      - android
       - ios
+      - linux
 
     runs-on: ubuntu-latest
 
@@ -429,10 +593,17 @@ jobs:
       actions: read
 
     steps:
-      - name: Download all build artifacts
+      - name: Download unsigned iOS artifact
         uses: actions/download-artifact@v7
         with:
-          path: artifacts
+          name: ios-unsigned
+          path: artifacts/ios-unsigned
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: linux
+          path: artifacts/linux
 
       - name: Show release files
         shell: bash
@@ -447,18 +618,19 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: artifacts/**/*
+          files: |
+            artifacts/ios-unsigned/*.ipa
+            artifacts/linux/*.AppImage
+            artifacts/linux/*.deb
           draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
             ## 安装说明
 
-            - Windows：下载 `.exe` 安装程序。
-            - macOS Intel：下载 `macos-x64` 对应的 `.dmg`。
-            - macOS Apple Silicon：下载 `macos-arm64` 对应的 `.dmg`。
-            - Android：下载 `.apk`。
-            - iOS：提供的是未签名 IPA，不能直接安装，也不能上传 App Store。
+            本 Release 提供未签名的 iOS IPA，以及 Linux AppImage 和 deb 安装包。
+
+            iOS IPA 不能直接安装，也不能上传 App Store。
 
             iOS 用户需要通过 AltStore、SideStore、Sideloadly、
             TrollStore 或其他签名工具重新签名后安装。

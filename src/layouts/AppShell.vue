@@ -20,7 +20,10 @@ const moreVisible = ref(false);
 const logoutLoading = ref(false);
 const { darkMode, sidebarCollapsed, themeIcon } = storeToRefs(appStore);
 const { loggedIn, user } = storeToRefs(authStore);
-const showQzoneButton = computed(() => platform() !== "android");
+const showQzoneButton = computed(() => {
+  const currentPlatform = platform();
+  return currentPlatform !== "android" && currentPlatform !== "ios";
+});
 const navigation = [
   { label: "概览", icon: "pi pi-home", to: "/" },
   { label: "归档", icon: "pi pi-inbox", to: "/archives" },

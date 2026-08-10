@@ -737,6 +737,16 @@ pub async fn check_web_login(
     })
 }
 
+// Cookie 注入只服务于桌面端额外的 QQ 空间 WebView。iOS/Android 的
+// WKWebView/系统 WebView 不应从异步 command 线程直接操作原生 Cookie Store，
+// 否则登录成功后可能触发 WebKit 主线程/RunLoop 竞态并以 SIGABRT 退出。
+#[cfg(any(target_os = "ios", target_os = "android"))]
+#[tauri::command]
+pub async fn sync_cookies_to_webview() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 #[tauri::command]
 pub async fn sync_cookies_to_webview(
     app: tauri::AppHandle,
