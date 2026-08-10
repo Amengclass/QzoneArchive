@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { ref, watch } from "vue";
+import { onMounted, ref, watch } from "vue";
 import Button from "primevue/button";
 import Dialog from "primevue/dialog";
 import InputNumber from "primevue/inputnumber";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAuthStore } from "../stores/auth";
 import { DEFAULT_ARCHIVE_INTERVAL, MIN_ARCHIVE_INTERVAL, getArchiveInterval, resetAppSettings, setArchiveInterval } from "../utils/appSettings";
@@ -16,7 +17,16 @@ const privacyVisible = ref(false);
 const deleteVisible = ref(false);
 const deleting = ref(false);
 const error = ref("");
+const appVersion = ref("");
 const sponsorImages = { wx: "/sponsor/wx.jpg", zfb: "/sponsor/zfb.jpg" };
+
+onMounted(async () => {
+  try {
+    appVersion.value = await getVersion();
+  } catch (reason) {
+    console.warn("读取应用版本失败", reason);
+  }
+});
 
 function hideMissingSponsorCode(event: Event) {
   (event.currentTarget as HTMLImageElement).hidden = true;
@@ -63,7 +73,7 @@ async function deleteEverything() {
     <article class="surface-card settings-card about-card">
       <div class="about-main">
         <div class="settings-copy"><span class="settings-icon"><i class="pi pi-info-circle" /></span><div><h3>关于</h3><p>Qzone Archive · 跨平台空间归档工具</p><p class="author-line">作者：<button class="author-link" type="button" @click="openUrl('https://space.bilibili.com/1117414477')">LibraHp_0928 <i class="pi pi-external-link" /></button></p></div></div>
-        <span class="version-badge">v1.0.2</span>
+        <span class="version-badge">{{ appVersion ? `v${appVersion}` : "版本未知" }}</span>
       </div>
       <div class="sponsor-section">
         <div class="sponsor-heading"><div><h4>赞助支持</h4><p>如果这个项目帮助到了你，可以请作者喝杯咖啡。</p></div><i class="pi pi-heart-fill" /></div>
