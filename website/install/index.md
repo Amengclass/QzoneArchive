@@ -61,6 +61,20 @@ chmod +x QzoneArchive-*.AppImage
 
 ### NixOS
 
+从 GitHub Releases 下载 `qzonearchive-nixos-x86_64-linux.tar.gz` 后，可以解压直接运行：
+
+```bash
+tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz
+./qzonearchive/bin/qzonearchive
+```
+
+也可以把解压出的目录加入 Nix profile：
+
+```bash
+tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz
+nix profile install ./qzonearchive
+```
+
 项目提供源码构建用的 Nix Flake。NixOS 用户可以进入项目目录执行：
 
 ```bash
