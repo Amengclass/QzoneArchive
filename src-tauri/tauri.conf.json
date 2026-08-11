@@ -47,6 +47,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "linux": {
+      "deb": {
+        "packageName": "qzonearchive"
+      }
+    },
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",
