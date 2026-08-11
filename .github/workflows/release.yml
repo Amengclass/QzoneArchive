@@ -275,6 +275,7 @@ jobs:
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
+            libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
 
@@ -282,7 +283,7 @@ jobs:
         run: npm ci
 
       - name: Build Linux bundles
-        run: npx tauri build --bundles appimage,deb
+        run: npx tauri build --bundles appimage,deb,rpm
 
       - name: Upload Linux bundles
         uses: actions/upload-artifact@v4
@@ -291,6 +292,7 @@ jobs:
           path: |
             src-tauri/target/release/bundle/appimage/*.AppImage
             src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
   # ── iOS ARM64 未签名 IPA ─────────────────────────────
@@ -654,6 +656,7 @@ jobs:
             artifacts/android/**/*.apk
             artifacts/linux/**/*.AppImage
             artifacts/linux/**/*.deb
+            artifacts/linux/**/*.rpm
           draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -661,7 +664,7 @@ jobs:
             ## 安装说明
 
             本 Release 提供 Windows 安装包、macOS x64/ARM64 DMG、Android APK、
-            未签名的 iOS IPA，以及 Linux AppImage 和 deb 安装包。
+            未签名的 iOS IPA，以及 Linux AppImage、deb 和 rpm 安装包。
 
             iOS IPA 不能直接安装，也不能上传 App Store。
 

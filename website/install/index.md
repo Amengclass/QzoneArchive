@@ -20,4 +20,56 @@ title: 安装
 
 ## Linux
 
-目前不提供预编译 Linux 包。具备 Rust、Node.js 20+ 与系统 WebKit 依赖的开发者可参考[开发](../development/)从源码构建。
+每个 Release 会提供三种 Linux 安装包：
+
+- `.deb`：适合 Debian、Ubuntu 及其衍生发行版
+- `.rpm`：适合 Fedora、openSUSE、RHEL 系发行版
+- `.AppImage`：适合大多数桌面发行版，包括无法直接使用 `.deb`/`.rpm` 的发行版
+
+### Debian / Ubuntu
+
+```bash
+sudo apt install ./QzoneArchive-*.deb
+```
+
+也可以使用 `dpkg`：
+
+```bash
+sudo dpkg -i QzoneArchive-*.deb
+```
+
+如果 `dpkg` 提示缺少依赖，先执行：
+
+```bash
+sudo apt-get install -f
+```
+
+### Fedora / openSUSE / RHEL 系
+
+```bash
+sudo rpm -i QzoneArchive-*.rpm
+```
+
+### 通用 AppImage
+
+```bash
+chmod +x QzoneArchive-*.AppImage
+./QzoneArchive-*.AppImage
+```
+
+如果桌面环境没有自动集成应用菜单，可以自行创建 `.desktop` 文件，也可以直接把 AppImage 放到本地路径手动启动。
+
+### NixOS
+
+项目目前没有发布 Nix 包，NixOS 用户可以先用 AppImage 验证功能。常见做法是：
+
+```bash
+chmod +x QzoneArchive-*.AppImage
+./QzoneArchive-*.AppImage
+```
+
+如果 AppImage 在当前系统缺少 FUSE 支持，可以启用 `appimage` 相关系统配置后重试，或参考发行版的 AppImage 运行方式。
+
+Linux 用户安装 QQ 客户端时，请按你自己发行版的要求选择 QQ 官方提供的 deb、rpm 或 Flatpak 版本；空间归档本身不绑定或内置 QQ 客户端，只需要登录后扫描 QQ 空间的二维码即可使用。
+
+从源码构建 Linux 版本可参考[开发](../development/)。
