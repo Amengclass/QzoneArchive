@@ -61,14 +61,31 @@ chmod +x QzoneArchive-*.AppImage
 
 ### NixOS
 
-项目目前没有发布 Nix 包，NixOS 用户可以先用 AppImage 验证功能。常见做法是：
+项目提供源码构建用的 Nix Flake。NixOS 用户可以进入项目目录执行：
+
+```bash
+nix build
+./result/bin/qzonearchive
+```
+
+也可以安装到当前用户 profile：
+
+```bash
+nix profile install
+```
+
+如果只为了快速验证官方 Release 的 AppImage，可以先启用 AppImage 支持：
+
+```nix
+programs.appimage.enable = true;
+```
+
+然后执行：
 
 ```bash
 chmod +x QzoneArchive-*.AppImage
 ./QzoneArchive-*.AppImage
 ```
-
-如果 AppImage 在当前系统缺少 FUSE 支持，可以启用 `appimage` 相关系统配置后重试，或参考发行版的 AppImage 运行方式。
 
 Linux 用户安装 QQ 客户端时，请按你自己发行版的要求选择 QQ 官方提供的 deb、rpm 或 Flatpak 版本；空间归档本身不绑定或内置 QQ 客户端，只需要登录后扫描 QQ 空间的二维码即可使用。
 
