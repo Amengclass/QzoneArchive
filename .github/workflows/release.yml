@@ -294,6 +294,48 @@ jobs:
             src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
+  # ── NixOS binary package ────────────────────────────
+  nixos:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v9
+
+      - name: Build Nix package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix build .#qzonearchive
+
+          ls -lh result/bin/qzonearchive
+          readlink -f result/bin/qzonearchive
+
+      - name: Package Nix result
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/nix
+          cp -Lr result qzonearchive
+          tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
+            qzonearchive
+          ls -lh dist/nix
+
+      - name: Upload NixOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixos
+          path: dist/nix/*.tar.gz
+          if-no-files-found: error
+
   # ── iOS ARM64 未签名 IPA ─────────────────────────────
   ios:
     # iOS 构建只能在 macOS Runner 上执行。
@@ -586,6 +628,7 @@ jobs:
       - android
       - ios
       - linux
+      - nixos
 
     runs-on: ubuntu-latest
 
@@ -634,6 +677,12 @@ jobs:
           name: linux
           path: artifacts/linux
 
+      - name: Download NixOS artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: nixos
+          path: artifacts/nixos
+
       - name: Show release files
         shell: bash
         run: |
@@ -656,6 +705,7 @@ jobs:
             artifacts/linux/**/*.AppImage
             artifacts/linux/**/*.deb
             artifacts/linux/**/*.rpm
+            artifacts/nixos/**/*.tar.gz
           draft: true
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -663,7 +713,7 @@ jobs:
             ## 安装说明
 
             本 Release 提供 Windows 安装包、macOS x64/ARM64 DMG、Android APK、
-            未签名的 iOS IPA，以及 Linux AppImage、deb 和 rpm 安装包。
+            未签名的 iOS IPA，以及 Linux AppImage、deb、rpm 和 NixOS 二进制包。
 
             iOS IPA 不能直接安装，也不能上传 App Store。
 
