@@ -327,7 +327,7 @@ jobs:
   # NixOS binary package
   nixos:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     if: ${{ ! inputs.skip_nixos }}
 
     steps:
@@ -376,8 +376,10 @@ jobs:
           mkdir -p nixos-package
           echo "$DRV_OUT_PATH" > nixos-package/store-path.txt
 
-          nix-store --export "$DRV_OUT_PATH" > nixos-package/qzonearchive.closure
+          mapfile -t CLOSURE_PATHS < <(nix-store -qR "$DRV_OUT_PATH")
+          nix-store --export "${CLOSURE_PATHS[@]}" > nixos-package/qzonearchive.closure
           echo "Closure size: $(stat -c %s nixos-package/qzonearchive.closure)"
+          echo "Closure paths: ${#CLOSURE_PATHS[@]}"
 
           rm -rf qzonearchive
           cp -Lr "$DRV_OUT_PATH" qzonearchive
@@ -386,13 +388,17 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          echo "Install steps for this NixOS release package:"
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          STORE_PATH="$(cat "$SCRIPT_DIR/store-path.txt")"
+
+          echo "Importing the Nix closure into the store (needs sudo, may take a while)..."
+          sudo nix-store --option require-sigs false --import < "$SCRIPT_DIR/qzonearchive.closure"
+
+          echo "Installing $STORE_PATH into the user profile..."
+          nix --extra-experimental-features "nix-command flakes" profile install "$STORE_PATH"
+
           echo ""
-          echo "  nix-store --import < qzonearchive.closure"
-          echo "  nix profile install /nix/store/PATH-qzonearchive-1.0.3"
-          echo ""
-          echo "Replace /nix/store/PATH-qzonearchive-1.0.3 with the store path from"
-          echo "the github artifact README or the closure top record."
+          echo "Done. Run 'qzonearchive' to start the app."
           EOF
           chmod +x nixos-package/install.sh
 
