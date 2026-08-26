@@ -21,6 +21,8 @@ export interface ArchiveSkipItem {
   error: string; skippedAt: number; retryCount: number; lastRetryAt?: number; resolvedAt?: number; recoveredRecords: number;
 }
 export interface ArchiveSkipRetryResult { success: boolean; message: string; recoveredRecords: number; }
+export const clearResolvedArchiveSkips = () => invoke<number>("clear_resolved_archive_skips");
+export interface ArchiveSkipBatchRetryResult { total: number; recovered: number; failed: number; recoveredRecords: number; }
 export interface ArchiveItem {
   id: number; cellId: string; publishedAt: number; content?: string; authorUin?: string;
   authorName?: string; pictureUrls: string[]; videoUrl?: string; videoUrls: string[]; videoCoverUrl?: string; likeCount: number; commentCount: number;
@@ -38,6 +40,7 @@ export const getArchiveProgress = () => invoke<ArchiveProgress>("get_archive_pro
 export const cancelFeedArchive = () => invoke<void>("cancel_feed_archive");
 export const listArchiveSkips = () => invoke<ArchiveSkipItem[]>("list_archive_skips");
 export const retryArchiveSkip = (id: number) => invoke<ArchiveSkipRetryResult>("retry_archive_skip", { id });
+export const retryAllArchiveSkips = () => invoke<ArchiveSkipBatchRetryResult>("retry_all_archive_skips");
 export const listArchivedFeeds = (limit = 100, offset = 0, category: ArchiveCategory = "self") => invoke<ArchiveItem[]>("list_archived_feeds", { limit, offset, category });
 export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invoke<ArchiveMediaPage>("list_archived_media", { limit, offset, year });
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
