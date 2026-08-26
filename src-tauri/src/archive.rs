@@ -59,6 +59,7 @@ pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
     batch_retrying: AtomicBool,
+    batch_cancel: AtomicBool,
     image_downloads: tokio::sync::Semaphore,
 }
 
@@ -68,6 +69,7 @@ impl ArchiveState {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
             batch_retrying: AtomicBool::new(false),
+            batch_cancel: AtomicBool::new(false),
             image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
@@ -1815,8 +1817,9 @@ pub async fn retry_all_archive_skips(
         failed: 0,
         recovered_records: 0,
     };
+    archive.batch_cancel.store(false, Ordering::Relaxed);
     for (index, id) in pending_ids.into_iter().enumerate() {
-        if archive.cancel.load(Ordering::Relaxed) {
+        if archive.batch_cancel.load(Ordering::Relaxed) {
             break;
         }
         set_progress(&archive, |progress| {
@@ -1866,6 +1869,7 @@ pub async fn retry_all_archive_skips(
         tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(interval_ms))).await;
     }
     archive.batch_retrying.store(false, Ordering::Relaxed);
+    archive.batch_cancel.store(false, Ordering::Relaxed);
     set_progress(&archive, |progress| {
         progress.batch_retry = None;
     });
@@ -1943,6 +1947,7 @@ async fn retry_single_skip(
 #[tauri::command]
 pub fn cancel_feed_archive(state: tauri::State<'_, ArchiveState>) {
     state.cancel.store(true, Ordering::Relaxed);
+    state.batch_cancel.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]

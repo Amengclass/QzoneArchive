@@ -139,7 +139,7 @@ onBeforeUnmount(() => window.clearInterval(timer));
 
   <section v-if="skips.length" class="surface-card task-skips">
     <div class="task-skips-heading"><div><span><i class="pi pi-exclamation-triangle" /></span><div><p class="section-kicker">SKIPPED REQUESTS</p><h3>异常跳过列表</h3></div></div><small>异常位置不会阻塞后续归档，可逐条或批量重试。</small></div>
-    <p v-if="skipNotice || (batchRetrying && batchProgress)" class="task-skip-notice" :class="{ 'is-busy': batchRetrying }"><i :class="batchRetrying ? 'pi pi-spin pi-spinner' : 'pi pi-info-circle'" />{{ skipNotice || (batchRetrying && batchProgress ? `${batchProgressText}（可在上方任务卡片停止）` : "") }}</p>
+    <p v-if="skipNotice" class="task-skip-notice" :class="{ 'is-busy': batchRetrying }"><i :class="batchRetrying ? 'pi pi-spin pi-spinner' : 'pi pi-info-circle'" />{{ skipNotice }}</p>
     <div class="task-skip-toolbar">
       <div class="task-skip-filters" role="tablist" aria-label="按恢复状态筛选">
         <button v-for="option in filterOptions" :key="option.value" type="button" role="tab" class="task-skip-filter" :class="{ 'is-active': skipFilter === option.value }" :aria-selected="skipFilter === option.value" @click="skipFilter = option.value">
