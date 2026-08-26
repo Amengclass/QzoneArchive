@@ -32,10 +32,10 @@ const navigation = [
   { label: "媒体", icon: "pi pi-images", to: "/media" },
   { label: "任务", icon: "pi pi-sync", to: "/tasks" },
   { label: "回收站", icon: "pi pi-trash", to: "/recycle-bin" },
-  { label: "设置", icon: "pi pi-cog", to: "/settings" },
 ];
+const settingsItem = { label: "设置", icon: "pi pi-cog", to: "/settings" };
 const mobileNavigation = [navigation[0], navigation[1], navigation[3], navigation[4]];
-const mobileMoreNavigation = [navigation[2], navigation[6]];
+const mobileMoreNavigation = [navigation[2], settingsItem];
 const moreActive = computed(() => mobileMoreNavigation.some((item) => item.to === route.path));
 function qzoneUrl() {
   const uin = user.value?.uin;
@@ -87,13 +87,20 @@ async function logout() {
           <img v-if="sidebarCollapsed" class="brand-toggle-icon" :src="sidebarToggleIcon" alt="" />
         </button>
         <div class="brand-copy"><strong>空间归档</strong><span>Qzone Archive</span></div>
-        <Button v-if="!sidebarCollapsed" class="brand-collapse" icon="pi pi-angle-left" severity="secondary" text rounded title="折叠侧边栏" aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
       </div>
+      <button v-if="!sidebarCollapsed" class="sidebar-collapse-btn" type="button" title="折叠侧边栏" aria-label="折叠侧边栏" @click="appStore.toggleSidebar">
+        <img class="sidebar-collapse-icon" :src="sidebarToggleIcon" alt="" />
+      </button>
       <nav class="side-navigation" aria-label="主要导航">
         <RouterLink v-for="item in navigation" :key="item.to" :to="item.to" :title="sidebarCollapsed ? item.label : undefined">
           <i :class="item.icon" /><span>{{ item.label }}</span>
         </RouterLink>
       </nav>
+      <div class="sidebar-footer">
+        <RouterLink :to="settingsItem.to" :title="sidebarCollapsed ? settingsItem.label : undefined" class="sidebar-settings-link">
+          <i :class="settingsItem.icon" /><span>{{ settingsItem.label }}</span>
+        </RouterLink>
+      </div>
     </aside>
     <div class="app-workspace">
       <header class="topbar">
