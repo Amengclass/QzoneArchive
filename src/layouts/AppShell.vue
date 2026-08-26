@@ -78,12 +78,12 @@ async function logout() {
         <div class="brand-copy"><strong>空间归档</strong><span>Qzone Archive</span></div>
       </div>
       <nav class="side-navigation" aria-label="主要导航">
-        <RouterLink v-for="item in navigation" :key="item.to" :to="item.to">
+        <RouterLink v-for="item in navigation" :key="item.to" :to="item.to" :title="sidebarCollapsed ? item.label : undefined">
           <i :class="item.icon" /><span>{{ item.label }}</span>
         </RouterLink>
       </nav>
       <div class="sidebar-footer">
-        <Button :icon="sidebarCollapsed ? 'pi pi-angle-right' : 'pi pi-angle-left'" severity="secondary" text rounded aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
+        <Button :icon="sidebarCollapsed ? 'pi pi-angle-right' : 'pi pi-angle-left'" severity="secondary" text rounded :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
       </div>
     </aside>
     <div class="app-workspace">
