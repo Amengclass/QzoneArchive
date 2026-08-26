@@ -74,17 +74,22 @@ async function logout() {
   <div class="app-shell" :class="{ 'app-dark': darkMode, 'sidebar-collapsed': sidebarCollapsed }">
     <aside class="desktop-sidebar">
       <div class="brand">
-        <div class="brand-mark"><i class="pi pi-box" /></div>
+        <button
+          class="brand-mark"
+          type="button"
+          :class="{ 'is-toggle': sidebarCollapsed }"
+          :title="sidebarCollapsed ? '展开侧边栏' : undefined"
+          aria-label="折叠侧边栏"
+          @click="sidebarCollapsed && appStore.toggleSidebar()"
+        ><i :class="sidebarCollapsed ? 'pi pi-bars' : 'pi pi-box'" /></button>
         <div class="brand-copy"><strong>空间归档</strong><span>Qzone Archive</span></div>
+        <Button v-if="!sidebarCollapsed" class="brand-collapse" icon="pi pi-angle-left" severity="secondary" text rounded title="折叠侧边栏" aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
       </div>
       <nav class="side-navigation" aria-label="主要导航">
         <RouterLink v-for="item in navigation" :key="item.to" :to="item.to" :title="sidebarCollapsed ? item.label : undefined">
           <i :class="item.icon" /><span>{{ item.label }}</span>
         </RouterLink>
       </nav>
-      <div class="sidebar-footer">
-        <Button :icon="sidebarCollapsed ? 'pi pi-angle-right' : 'pi pi-angle-left'" severity="secondary" text rounded :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
-      </div>
     </aside>
     <div class="app-workspace">
       <header class="topbar">
