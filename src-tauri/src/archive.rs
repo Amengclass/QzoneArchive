@@ -1865,8 +1865,17 @@ pub async fn retry_all_archive_skips(
                 });
             }
         }
-        // 与归档任务保持一致的节奏，避免批量重试触发频率保护
-        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(interval_ms))).await;
+        // 与归档任务保持一致的节奏，避免批量重试触发频率保护；
+        // 分片睡眠让"停止重试"能在当前请求结束后立即生效
+        let mut remaining_delay = archive_page_delay_ms(interval_ms);
+        while remaining_delay > 0 {
+            if archive.batch_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let slice = remaining_delay.min(200);
+            tokio::time::sleep(std::time::Duration::from_millis(slice)).await;
+            remaining_delay -= slice;
+        }
     }
     archive.batch_retrying.store(false, Ordering::Relaxed);
     archive.batch_cancel.store(false, Ordering::Relaxed);

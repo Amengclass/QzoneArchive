@@ -20,6 +20,7 @@ const skipNotice = ref("");
 const skipFilter = ref<"all" | "pending" | "resolved">("all");
 const clearingResolved = ref(false);
 const batchRetrying = ref(false);
+const batchStopping = ref(false);
 const currentTime = ref(Date.now());
 let timer: number | undefined;
 const running = computed(() => progress.value.status === "running");
@@ -97,17 +98,25 @@ async function retryAllPending() {
   beginPolling();
   try {
     const result = await retryAllArchiveSkips(getArchiveInterval());
-    skipNotice.value = result.total === 0
-      ? "没有待重试的异常记录"
-      : `批量重试完成：共 ${result.total} 条，成功恢复 ${result.recovered} 条${result.failed ? `，失败 ${result.failed} 条` : ""}${result.recoveredRecords ? `，找回 ${result.recoveredRecords} 条接口记录` : ""}`;
+    skipNotice.value = batchStopping.value
+      ? `已停止批量重试：本次恢复 ${result.recovered} 条${result.failed ? `，失败 ${result.failed} 条` : ""}`
+      : result.total === 0
+        ? "没有待重试的异常记录"
+        : `批量重试完成：共 ${result.total} 条，成功恢复 ${result.recovered} 条${result.failed ? `，失败 ${result.failed} 条` : ""}${result.recoveredRecords ? `，找回 ${result.recoveredRecords} 条接口记录` : ""}`;
   } catch (error) {
     skipNotice.value = String(error);
   } finally {
     batchRetrying.value = false;
+    batchStopping.value = false;
     window.clearInterval(timer);
     timer = undefined;
     await refresh();
   }
+}
+async function stopBatchRetry() {
+  if (batchStopping.value) return;
+  batchStopping.value = true;
+  await cancelFeedArchive();
 }
 function formatTime(timestamp?: number) {
   return timestamp ? new Date(timestamp * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
@@ -127,13 +136,13 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <p class="task-message">{{ progress.message }}</p>
     <ProgressBar v-if="running" mode="indeterminate" style="height: 7px" />
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
-    <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-replay" /></span><div><strong>批量重试异常位置</strong><p>{{ batchProgressText }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
+    <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-replay" /></span><div><strong>{{ batchStopping ? "正在停止批量重试…" : "批量重试异常位置" }}</strong><p>{{ batchProgressText }}{{ batchStopping ? " · 等待当前请求结束后停止" : "" }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
     <div class="task-actions">
       <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
       <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
-      <Button v-if="batchRetrying" label="停止重试" icon="pi pi-stop" severity="warn" outlined @click="cancel" />
+      <Button v-if="batchRetrying" :label="batchStopping ? '正在停止…' : '停止重试'" icon="pi pi-stop" severity="warn" outlined :loading="batchStopping" :disabled="batchStopping" @click="stopBatchRetry" />
     </div>
   </section>
 
