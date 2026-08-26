@@ -26,6 +26,18 @@ pub struct ArchiveProgress {
     skipped: u32,
     message: String,
     retry_at: Option<i64>,
+    batch_retry: Option<BatchRetryProgress>,
+}
+
+/// 批量重试异常跳过记录时的实时进度。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRetryProgress {
+    current: u32,
+    total: u32,
+    recovered: u32,
+    failed: u32,
+    recovered_records: u64,
 }
 
 impl Default for ArchiveProgress {
@@ -38,6 +50,7 @@ impl Default for ArchiveProgress {
             skipped: 0,
             message: "尚未开始归档".into(),
             retry_at: None,
+            batch_retry: None,
         }
     }
 }
@@ -45,6 +58,7 @@ impl Default for ArchiveProgress {
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
+    batch_retrying: AtomicBool,
     image_downloads: tokio::sync::Semaphore,
 }
 
@@ -53,6 +67,7 @@ impl ArchiveState {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
+            batch_retrying: AtomicBool::new(false),
             image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
@@ -1410,6 +1425,9 @@ pub async fn start_feed_archive(
     interval_ms: u64,
 ) -> Result<ArchiveProgress, String> {
     let interval_ms = interval_ms.clamp(2_000, 30_000);
+    if archive.batch_retrying.load(Ordering::Relaxed) {
+        return Err("正在批量重试异常位置，请等待完成或停止后再开始归档".into());
+    }
     {
         let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
         if progress.status == "running" {
@@ -1423,6 +1441,7 @@ pub async fn start_feed_archive(
             skipped: 0,
             message: "正在准备归档…".into(),
             retry_at: None,
+            batch_retry: None,
         };
     }
     archive.cancel.store(false, Ordering::Relaxed);
@@ -1768,6 +1787,13 @@ pub async fn retry_all_archive_skips(
 ) -> Result<ArchiveSkipBatchRetryResult, String> {
     let owner_uin = login.qzone_auth().await?.uin;
     ensure_archive_idle(&archive)?;
+    if archive
+        .batch_retrying
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err("已有批量重试在进行中".into());
+    }
     let pending_ids = {
         let connection = open_database(&app)?;
         let mut statement = connection
@@ -1782,8 +1808,9 @@ pub async fn retry_all_archive_skips(
         rows.collect::<Result<Vec<i64>, _>>()
             .map_err(|error| format!("解析异常跳过列表失败：{error}"))?
     };
+    let total = pending_ids.len() as u32;
     let mut result = ArchiveSkipBatchRetryResult {
-        total: pending_ids.len() as u32,
+        total,
         recovered: 0,
         failed: 0,
         recovered_records: 0,
@@ -1793,8 +1820,13 @@ pub async fn retry_all_archive_skips(
             break;
         }
         set_progress(&archive, |progress| {
-            progress.message =
-                format!("正在批量重试异常位置 {}/{index}…", result.total);
+            progress.batch_retry = Some(BatchRetryProgress {
+                current: index as u32 + 1,
+                total,
+                recovered: result.recovered,
+                failed: result.failed,
+                recovered_records: result.recovered_records,
+            });
         });
         match retry_single_skip(&app, &login, &archive, &owner_uin, id).await {
             Ok(outcome) => {
@@ -1804,19 +1836,38 @@ pub async fn retry_all_archive_skips(
                 } else {
                     result.failed += 1;
                 }
+                set_progress(&archive, |progress| {
+                    progress.batch_retry = Some(BatchRetryProgress {
+                        current: index as u32 + 1,
+                        total,
+                        recovered: result.recovered,
+                        failed: result.failed,
+                        recovered_records: result.recovered_records,
+                    });
+                });
             }
             Err(error) => {
                 if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中") {
                     break;
                 }
                 result.failed += 1;
+                set_progress(&archive, |progress| {
+                    progress.batch_retry = Some(BatchRetryProgress {
+                        current: index as u32 + 1,
+                        total,
+                        recovered: result.recovered,
+                        failed: result.failed,
+                        recovered_records: result.recovered_records,
+                    });
+                });
             }
         }
         // 与归档任务保持一致的节奏，避免批量重试触发频率保护
         tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(interval_ms))).await;
     }
+    archive.batch_retrying.store(false, Ordering::Relaxed);
     set_progress(&archive, |progress| {
-        progress.message = "尚未开始归档".into();
+        progress.batch_retry = None;
     });
     Ok(result)
 }

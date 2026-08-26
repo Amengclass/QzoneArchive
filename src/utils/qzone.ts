@@ -15,7 +15,8 @@ export function fetchMoreFeeds(attachInfo: string) {
 }
 
 export type ArchiveStatus = "idle" | "running" | "completed" | "cancelled" | "limited" | "error";
-export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; }
+export interface BatchRetryProgress { current: number; total: number; recovered: number; failed: number; recoveredRecords: number; }
+export interface ArchiveProgress { status: ArchiveStatus; pages: number; fetched: number; saved: number; skipped: number; message: string; retryAt?: number; batchRetry?: BatchRetryProgress; }
 export interface ArchiveSkipItem {
   id: number; pageNumber: number; cursorOffset: number; offsetAdvance: number; baseTime: number;
   error: string; skippedAt: number; retryCount: number; lastRetryAt?: number; resolvedAt?: number; recoveredRecords: number;

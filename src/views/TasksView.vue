@@ -31,6 +31,12 @@ const severity = computed(() => ({ completed: "success", error: "danger", cancel
 const statusText = computed(() => ({ idle: "未开始", running: "进行中", completed: "已完成", cancelled: "已取消", limited: "频率保护", error: "失败" }[progress.value.status]));
 const pendingSkips = computed(() => skips.value.filter((item) => !item.resolvedAt));
 const resolvedSkips = computed(() => skips.value.filter((item) => item.resolvedAt));
+const batchProgress = computed(() => progress.value.batchRetry);
+const batchProgressText = computed(() => {
+  const b = batchProgress.value;
+  if (!b) return "";
+  return `正在重试 ${Math.min(b.current, b.total)}/${b.total} · 已恢复 ${b.recovered}${b.failed ? ` · 失败 ${b.failed}` : ""}`;
+});
 const filteredSkips = computed(() => {
   if (skipFilter.value === "pending") return pendingSkips.value;
   if (skipFilter.value === "resolved") return resolvedSkips.value;
@@ -111,7 +117,7 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value) beginPolling(); });
+onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value) beginPolling(); });
 onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
@@ -121,14 +127,19 @@ onBeforeUnmount(() => window.clearInterval(timer));
     <p class="task-message">{{ progress.message }}</p>
     <ProgressBar v-if="running" mode="indeterminate" style="height: 7px" />
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
+    <div v-if="batchRetrying && batchProgress" class="task-batch-progress"><span><i class="pi pi-replay" /></span><div><strong>批量重试异常位置</strong><p>{{ batchProgressText }}</p><ProgressBar :value="(Math.min(batchProgress.current, batchProgress.total) / batchProgress.total) * 100" :show-value="false" style="height: 6px" /></div></div>
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
-    <div class="task-actions"><Button :label="running ? '归档中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || rateWaiting || !loggedIn" @click="start" /><Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" /></div>
+    <div class="task-actions">
+      <Button :label="running ? '归档中…' : batchRetrying ? '批量重试中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || batchRetrying || rateWaiting || !loggedIn" @click="start" />
+      <Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" />
+      <Button v-if="batchRetrying" label="停止重试" icon="pi pi-stop" severity="warn" outlined @click="cancel" />
+    </div>
   </section>
 
   <section v-if="skips.length" class="surface-card task-skips">
     <div class="task-skips-heading"><div><span><i class="pi pi-exclamation-triangle" /></span><div><p class="section-kicker">SKIPPED REQUESTS</p><h3>异常跳过列表</h3></div></div><small>异常位置不会阻塞后续归档，可逐条或批量重试。</small></div>
-    <p v-if="skipNotice" class="task-skip-notice" :class="{ 'is-busy': batchRetrying }"><i :class="batchRetrying ? 'pi pi-spin pi-spinner' : 'pi pi-info-circle'" />{{ skipNotice || (batchRetrying ? progress.message : "") }}</p>
+    <p v-if="skipNotice || (batchRetrying && batchProgress)" class="task-skip-notice" :class="{ 'is-busy': batchRetrying }"><i :class="batchRetrying ? 'pi pi-spin pi-spinner' : 'pi pi-info-circle'" />{{ skipNotice || (batchRetrying && batchProgress ? `${batchProgressText}（可在上方任务卡片停止）` : "") }}</p>
     <div class="task-skip-toolbar">
       <div class="task-skip-filters" role="tablist" aria-label="按恢复状态筛选">
         <button v-for="option in filterOptions" :key="option.value" type="button" role="tab" class="task-skip-filter" :class="{ 'is-active': skipFilter === option.value }" :aria-selected="skipFilter === option.value" @click="skipFilter = option.value">
