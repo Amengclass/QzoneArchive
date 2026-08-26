@@ -18,6 +18,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            use tauri::Manager;
+            app.state::<qlogin::QLoginState>()
+                .set_app_handle(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             exit_app,
             qlogin::start_qr_login,
@@ -43,6 +49,8 @@ pub fn run() {
             archive::get_archive_progress,
             archive::cancel_feed_archive,
             archive::list_archive_skips,
+            archive::clear_resolved_archive_skips,
+            archive::retry_all_archive_skips,
             archive::clear_resolved_archive_skips,
             archive::retry_all_archive_skips,
             archive::retry_archive_skip,

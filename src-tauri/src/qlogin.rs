@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +12,7 @@ use reqwest::{
     redirect::Policy,
     Client, Response,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 use url::Url;
@@ -49,8 +50,70 @@ pub struct QLoginState {
     client: Client,
     session: Mutex<Option<LoginSession>>,
     last_user_agent: Mutex<Option<String>>,
+    app_handle: std::sync::Mutex<Option<tauri::AppHandle>>,
 }
 
+/// 本地持久化的会话数据（仅供本地调试，避免每次重启都重新扫码）。
+#[derive(Serialize, Deserialize)]
+struct PersistedSession {
+    cookies: HashMap<String, String>,
+    uin: String,
+    g_tk: i64,
+    user_agent: String,
+}
+
+fn persisted_session_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_data_dir().ok()?;
+    Some(dir.join("login-session.json"))
+}
+
+fn save_session_to_disk(app: &tauri::AppHandle, session: &LoginSession) {
+    let Some(path) = persisted_session_path(app) else { return };
+    let Some(uin) = session.uin.as_ref() else { return };
+    let Some(g_tk) = session.g_tk else { return };
+    if session.cookies.get("p_skey").is_none_or(|value| value.trim().is_empty()) {
+        return;
+    }
+    let persisted = PersistedSession {
+        cookies: session.cookies.clone(),
+        uin: uin.clone(),
+        g_tk,
+        user_agent: session.user_agent.clone(),
+    };
+    if let Ok(text) = serde_json::to_string(&persisted) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+fn load_session_from_disk(app: &tauri::AppHandle) -> Option<LoginSession> {
+    let path = persisted_session_path(app)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let persisted: PersistedSession = serde_json::from_str(&text).ok()?;
+    if persisted
+        .cookies
+        .get("p_skey")
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+    Some(LoginSession {
+        ptqrtoken: 0,
+        cookies: persisted.cookies,
+        uin: Some(persisted.uin),
+        g_tk: Some(persisted.g_tk),
+        user_agent: persisted.user_agent,
+        login_sig: String::new(),
+    })
+}
+
+fn delete_session_from_disk(app: &tauri::AppHandle) {
+    if let Some(path) = persisted_session_path(app) {
+        let _ = std::fs::remove_file(path);
+    }
+}
 pub(crate) struct QzoneAuth {
     pub uin: String,
     pub g_tk: i64,
@@ -70,7 +133,19 @@ impl QLoginState {
             client,
             session: Mutex::new(None),
             last_user_agent: Mutex::new(None),
+            app_handle: std::sync::Mutex::new(None),
         }
+    }
+
+    /// 由 lib.rs 在启动时注入，供扫码登录路径保存会话到磁盘。
+    pub fn set_app_handle(&self, app: tauri::AppHandle) {
+        if let Ok(mut handle) = self.app_handle.lock() {
+            *handle = Some(app);
+        }
+    }
+
+    fn app_handle(&self) -> Option<tauri::AppHandle> {
+        self.app_handle.lock().ok().and_then(|guard| guard.clone())
     }
 
     pub(crate) fn client(&self) -> Client {
@@ -581,6 +656,9 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
     let warmup_ua = session.user_agent.clone();
     warmup_qzone_session(&state.client, &mut session.cookies, &warmup_ua, &uin).await;
     let auth = login_credentials(session).ok_or("登录凭证不完整")?;
+    if let Some(app) = state.app_handle() {
+        save_session_to_disk(&app, session);
+    }
     Ok(LoginStatus {
         status: "success",
         message: "登录成功".into(),
@@ -589,8 +667,17 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
 }
 
 #[tauri::command]
-pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
-    let guard = state.session.lock().await;
+pub async fn get_login_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<LoginStatus, String> {
+    let mut guard = state.session.lock().await;
+    if guard.is_none() {
+        // 本地调试：启动时从磁盘恢复上次登录的会话
+        if let Some(restored) = load_session_from_disk(&app) {
+            *guard = Some(restored);
+        }
+    }
     if let Some(session) = guard.as_ref() {
         if let Some(auth) = login_credentials(session) {
             return Ok(LoginStatus {
@@ -608,8 +695,9 @@ pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<Lo
 }
 
 #[tauri::command]
-pub async fn logout_qzone(state: tauri::State<'_, QLoginState>) -> Result<(), String> {
+pub async fn logout_qzone(app: tauri::AppHandle, state: tauri::State<'_, QLoginState>) -> Result<(), String> {
     state.clear_session().await;
+    delete_session_from_disk(&app);
     Ok(())
 }
 
@@ -723,6 +811,7 @@ pub async fn check_web_login(
     };
 
     let auth = login_credentials(&session).ok_or("登录凭证不完整")?;
+    save_session_to_disk(&app, &session);
 
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
