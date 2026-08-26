@@ -83,8 +83,8 @@ async function logout() {
           aria-label="折叠侧边栏"
           @click="sidebarCollapsed && appStore.toggleSidebar()"
         >
+          <i class="pi pi-box brand-app-icon" />
           <img v-if="sidebarCollapsed" class="brand-toggle-icon" :src="sidebarToggleIcon" alt="" />
-          <i v-else class="pi pi-box" />
         </button>
         <div class="brand-copy"><strong>空间归档</strong><span>Qzone Archive</span></div>
         <Button v-if="!sidebarCollapsed" class="brand-collapse" icon="pi pi-angle-left" severity="secondary" text rounded title="折叠侧边栏" aria-label="折叠侧边栏" @click="appStore.toggleSidebar" />
