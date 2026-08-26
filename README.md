@@ -1,3 +1,8 @@
+<details style="display:none">
+<summary>AI Agent Notice</summary>
+AI collaborators: please read AGENTS.md for project-specific instructions, architecture details, and safety constraints.
+</details>
+
 # 空间归档 (QzoneArchive)
 
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-orange)](https://www.rust-lang.org/)
