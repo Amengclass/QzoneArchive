@@ -1764,6 +1764,7 @@ pub async fn retry_all_archive_skips(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
     archive: tauri::State<'_, ArchiveState>,
+    interval_ms: u64,
 ) -> Result<ArchiveSkipBatchRetryResult, String> {
     let owner_uin = login.qzone_auth().await?.uin;
     ensure_archive_idle(&archive)?;
@@ -1811,7 +1812,8 @@ pub async fn retry_all_archive_skips(
                 result.failed += 1;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        // 与归档任务保持一致的节奏，避免批量重试触发频率保护
+        tokio::time::sleep(std::time::Duration::from_millis(archive_page_delay_ms(interval_ms))).await;
     }
     set_progress(&archive, |progress| {
         progress.message = "尚未开始归档".into();

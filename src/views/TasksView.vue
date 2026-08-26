@@ -90,7 +90,7 @@ async function retryAllPending() {
   skipNotice.value = "";
   beginPolling();
   try {
-    const result = await retryAllArchiveSkips();
+    const result = await retryAllArchiveSkips(getArchiveInterval());
     skipNotice.value = result.total === 0
       ? "没有待重试的异常记录"
       : `批量重试完成：共 ${result.total} 条，成功恢复 ${result.recovered} 条${result.failed ? `，失败 ${result.failed} 条` : ""}${result.recoveredRecords ? `，找回 ${result.recoveredRecords} 条接口记录` : ""}`;
