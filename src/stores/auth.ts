@@ -42,7 +42,16 @@ export const useAuthStore = defineStore("auth", () => {
       message.value = result.message;
       if (result.status === "success" && result.auth) {
         credentials.value = result.auth;
-        user.value = await getQzoneLoginUser(result.auth);
+        try {
+          user.value = await getQzoneLoginUser(result.auth);
+        } catch {
+          // Cookie 过期或网络异常——清除本地会话并提示重新登录
+          credentials.value = undefined;
+          status.value = "loggedOut";
+          message.value = "登录已过期，请重新扫码登录";
+          user.value = undefined;
+          await invoke("logout_qzone").catch(() => {});
+        }
       }
     } catch {
       status.value = "loggedOut";
