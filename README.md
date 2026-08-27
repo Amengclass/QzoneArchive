@@ -12,11 +12,8 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 
 将 QQ 空间动态、照片、视频与互动记录安全归档到本地的桌面 / 移动端工具。
 
-#### 使用教程
-[详细食用教程](https://www.bilibili.com/video/BV1p7MZ6xEfk) 
-
-#### 网盘下载地址：
-[`夸克`](https://pan.quark.cn/s/69baf8c8aadc)
+[**详细使用教程**](https://www.bilibili.com/video/BV1p7MZ6xEfk) 
+[**网盘下载地址**](https://pan.quark.cn/s/69baf8c8aadc)
 
 <a href="https://www.star-history.com/?repos=Gaoshu705%2FQzoneArchive&type=date&legend=top-left">
  <picture>
