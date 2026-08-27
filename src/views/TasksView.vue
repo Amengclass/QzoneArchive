@@ -53,6 +53,7 @@ const filterCount = (value: (typeof filterOptions)[number]["value"]) =>
 
 async function refresh() {
   try { progress.value = await getArchiveProgress(); } catch { /* 保留当前状态 */ }
+  if (progress.value.batchRetry) batchRetrying.value = true;
   if (!loggedIn.value) { skips.value = []; return; }
   try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
 }
@@ -106,8 +107,10 @@ async function retryAllPending() {
   } catch (error) {
     skipNotice.value = String(error);
   } finally {
-    batchRetrying.value = false;
-    batchStopping.value = false;
+    if (!progress.value.batchRetry) {
+      batchRetrying.value = false;
+      batchStopping.value = false;
+    }
     window.clearInterval(timer);
     timer = undefined;
     await refresh();
@@ -126,7 +129,7 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value) beginPolling(); });
+onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value || batchRetrying.value || batchProgress.value) beginPolling(); });
 onBeforeUnmount(() => window.clearInterval(timer));
 </script>
 
