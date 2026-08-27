@@ -240,7 +240,7 @@ function toggleVisible() {
 }
 function askDelete(action: DeleteAction) { pendingAction.value = action; confirmVisible.value = true; }
 function toggleComments(id: number) { expandedComments.has(id) ? expandedComments.delete(id) : expandedComments.add(id); }
-function changePage(event: PageState) { first.value = event.first; pageSize.value = event.rows; void load(); }
+function changePage(event: PageState) { first.value = event.first; pageSize.value = event.rows; void load(); document.querySelector('.app-shell')?.scrollTo(0, 0); }
 async function confirmDelete() {
   deleting.value = true; error.value = "";
   try {
