@@ -107,13 +107,13 @@ async function retryAllPending() {
   } catch (error) {
     skipNotice.value = String(error);
   } finally {
+    await refresh();
     if (!progress.value.batchRetry) {
       batchRetrying.value = false;
       batchStopping.value = false;
     }
     window.clearInterval(timer);
     timer = undefined;
-    await refresh();
   }
 }
 async function stopBatchRetry() {
