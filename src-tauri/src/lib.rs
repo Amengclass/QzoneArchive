@@ -43,6 +43,8 @@ pub fn run() {
             archive::get_archive_progress,
             archive::cancel_feed_archive,
             archive::list_archive_skips,
+            archive::clear_resolved_archive_skips,
+            archive::retry_all_archive_skips,
             archive::retry_archive_skip,
             archive::list_archived_feeds,
             archive::list_archived_media,

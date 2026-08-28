@@ -11,9 +11,11 @@ import InputText from "primevue/inputtext";
 import Paginator, { type PageState } from "primevue/paginator";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
+import { useAuthStore } from "../stores/auth";
 import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 type DeleteAction = "selected" | "all";
+const authStore = useAuthStore();
 const records = ref<ArchiveItem[]>([]);
 const query = ref("");
 const loading = ref(false);
@@ -240,7 +242,7 @@ function toggleVisible() {
 }
 function askDelete(action: DeleteAction) { pendingAction.value = action; confirmVisible.value = true; }
 function toggleComments(id: number) { expandedComments.has(id) ? expandedComments.delete(id) : expandedComments.add(id); }
-function changePage(event: PageState) { first.value = event.first; pageSize.value = event.rows; void load(); }
+function changePage(event: PageState) { first.value = event.first; pageSize.value = event.rows; void load(); document.querySelector('.app-shell')?.scrollTo(0, 0); }
 async function confirmDelete() {
   deleting.value = true; error.value = "";
   try {
@@ -251,7 +253,7 @@ async function confirmDelete() {
   } catch (reason) { error.value = String(reason); }
   finally { deleting.value = false; }
 }
-onMounted(load);
+onMounted(async () => { if (authStore.loggedIn) await load(); });
 watch(category, () => { first.value = 0; query.value = ""; void load(); });
 onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVideos(); });
 </script>

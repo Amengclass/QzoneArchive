@@ -11,8 +11,10 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 将 QQ 空间动态、照片、视频与互动记录安全归档到本地的桌面 / 移动端工具。
-[详细食用教程](https://www.bilibili.com/video/BV1SiuZ6KEwy) 
- 
+
+[**详细使用教程**](https://www.bilibili.com/video/BV1p7MZ6xEfk) 
+[**网盘下载地址**](https://pan.quark.cn/s/69baf8c8aadc)
+
 <a href="https://www.star-history.com/?repos=Gaoshu705%2FQzoneArchive&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Gaoshu705/QzoneArchive&type=date&theme=dark&legend=top-left&sealed_token=VVJL1S9RMakv50gmYM8C74miiTpiN4O14StqOWLkzBbJNM_ksdUxftRGOvO_1_fnDnEscvd9qj6qqnS-9dOYZkIrJhVYFxgmxN_0xduxtjm1eICUxBdfIQ" />
