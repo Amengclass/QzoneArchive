@@ -797,8 +797,7 @@ fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<
 }
 
 fn feed_retry_delay(attempt: u32) -> std::time::Duration {
-    let ms = 1_500 * 2_u64.pow(attempt.saturating_sub(1));
-    std::time::Duration::from_millis(ms.min(8_000))
+    std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
 }
 
 fn sec_ch_ua(user_agent: &str) -> String {
