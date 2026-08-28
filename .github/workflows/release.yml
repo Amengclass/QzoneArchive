@@ -117,8 +117,9 @@ jobs:
 
       - name: Rename artifacts with platform prefix
         run: |
-          for f in src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do
-            mv "$f" "macos_x64_$(basename "$f")"
+          DMG_DIR="src-tauri/target/x86_64-apple-darwin/release/bundle/dmg"
+          for f in "$DMG_DIR"/*.dmg; do
+            mv "$f" "$DMG_DIR/macos_x64_$(basename "$f")"
           done
 
       - name: Show macOS x64 artifacts
@@ -165,8 +166,9 @@ jobs:
 
       - name: Rename artifacts with platform prefix
         run: |
-          for f in src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
-            mv "$f" "macos_arm64_$(basename "$f")"
+          DMG_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle/dmg"
+          for f in "$DMG_DIR"/*.dmg; do
+            mv "$f" "$DMG_DIR/macos_arm64_$(basename "$f")"
           done
 
       - name: Show macOS ARM64 artifacts
