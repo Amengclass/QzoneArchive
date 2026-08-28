@@ -1566,32 +1566,7 @@ pub async fn start_feed_archive(
                     }
                 }
             } else {
-                let mut first_page_result = None;
-                for first_attempt in 1..=3u32 {
-                    match qzone::fetch_feeds(&login, "1", None).await {
-                        Ok(page) => {
-                            first_page_result = Some(page);
-                            break;
-                        }
-                        Err(error) if qzone::feed_error_can_skip(&error) => {
-                            if first_attempt < 3 {
-                                set_progress(&archive, |progress| {
-                                    progress.message = format!(
-                                        "第一页请求失败（{error}），{first_attempt}/3 次重试中…"
-                                    );
-                                });
-                                tokio::time::sleep(std::time::Duration::from_secs(
-                                    (first_attempt as u64) * 3,
-                                ))
-                                .await;
-                                continue;
-                            }
-                            return Err(format!("第一页获取空间动态失败（已重试3次）：{error}"));
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                first_page_result.ok_or("第一页获取空间动态失败：未知错误")?
+                qzone::fetch_feeds(&login, "1", None).await?
             };
             let fetched = page.feeds.len() as u64;
             let next = if page.has_more {

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::qlogin::QLoginState;
 
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
-const FEED_RESPONSE_ATTEMPTS: u32 = 6;
+const FEED_RESPONSE_ATTEMPTS: u32 = 3;
 const RECYCLE_WINDOW_LABEL: &str = "qzone-recycle-auth";
 const RECYCLE_ALBUM_LIST_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_alist_recycle_v2";
