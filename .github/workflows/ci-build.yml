@@ -91,6 +91,19 @@ jobs:
             xdg-utils
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb,rpm
+      - name: Rename Linux artifacts with platform prefix
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          PLATFORM="${{ matrix.artifact }}"  # e.g. linux-x64, linux-arm64
+          for dir in appimage deb rpm; do
+            [ -d "$BUNDLE_DIR/$dir" ] || continue
+            for f in "$BUNDLE_DIR/$dir"/*; do
+              [ -f "$f" ] || continue
+              base="$(basename "$f")"
+              mv "$f" "$BUNDLE_DIR/$dir/${PLATFORM}_${base}"
+            done
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
@@ -255,11 +268,11 @@ jobs:
           cp artifacts/windows/*.exe nightly/QzoneArchive-nightly_x64-setup.exe
           cp artifacts/macos-x64/*.dmg nightly/QzoneArchive-nightly_x64.dmg
           cp artifacts/macos-arm64/*.dmg nightly/QzoneArchive-nightly_aarch64.dmg
-          cp artifacts/linux-x64/*.AppImage nightly/QzoneArchive-nightly_amd64.AppImage
-          cp artifacts/linux-x64/*.deb nightly/QzoneArchive-nightly_amd64.deb
-          cp artifacts/linux-x64/*.rpm nightly/QzoneArchive-nightly_x86_64.rpm
-          cp artifacts/linux-arm64/*.AppImage nightly/QzoneArchive-nightly_aarch64.AppImage
-          cp artifacts/linux-arm64/*.deb nightly/QzoneArchive-nightly_arm64.deb
+          cp artifacts/linux-x64/linux-x64_*.AppImage nightly/
+          cp artifacts/linux-x64/linux-x64_*.deb nightly/
+          cp artifacts/linux-x64/linux-x64_*.rpm nightly/
+          cp artifacts/linux-arm64/linux-arm64_*.AppImage nightly/
+          cp artifacts/linux-arm64/linux-arm64_*.deb nightly/
           cp artifacts/android/*.apk nightly/QzoneArchive-nightly-universal.apk
           cp artifacts/ios-unsigned/*.ipa nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
           cp artifacts/nixos/*.tar.gz nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
