@@ -60,6 +60,15 @@ jobs:
           retention-days: 90
 
   linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            artifact: linux-arm64
+            cross: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +77,22 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux build dependencies
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+      - name: Install Linux build dependencies (x64)
+        if: ${{ !matrix.cross }}
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -76,15 +100,25 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf
+      - name: Install Linux build dependencies (ARM64)
+        if: matrix.cross
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update || sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev:arm64 \
+            libayatana-appindicator3-dev:arm64 \
+            librsvg2-dev:arm64 \
+            patchelf
       - run: npm ci
-      - run: npx tauri build --bundles appimage,deb,rpm
+      - run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb,rpm
       - uses: actions/upload-artifact@v4
         with:
-          name: qzonearchive-linux-${{ github.sha }}
+          name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
           path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
           if-no-files-found: error
           retention-days: 90
 
@@ -215,8 +249,12 @@ jobs:
           path: artifacts/macos-arm64
       - uses: actions/download-artifact@v7
         with:
-          name: qzonearchive-linux-${{ github.sha }}
-          path: artifacts/linux
+          name: qzonearchive-linux-x64-${{ github.sha }}
+          path: artifacts/linux-x64
+      - uses: actions/download-artifact@v7
+        with:
+          name: qzonearchive-linux-arm64-${{ github.sha }}
+          path: artifacts/linux-arm64
       - uses: actions/download-artifact@v7
         with:
           name: qzonearchive-android-${{ github.sha }}
@@ -238,9 +276,11 @@ jobs:
           cp artifacts/windows/*.exe nightly/QzoneArchive-nightly_x64-setup.exe
           cp artifacts/macos-x64/*.dmg nightly/QzoneArchive-nightly_x64.dmg
           cp artifacts/macos-arm64/*.dmg nightly/QzoneArchive-nightly_aarch64.dmg
-          cp artifacts/linux/*.AppImage nightly/QzoneArchive-nightly_amd64.AppImage
-          cp artifacts/linux/*.deb nightly/QzoneArchive-nightly_amd64.deb
-          cp artifacts/linux/*.rpm nightly/QzoneArchive-nightly_x86_64.rpm
+          cp artifacts/linux-x64/*.AppImage nightly/QzoneArchive-nightly_amd64.AppImage
+          cp artifacts/linux-x64/*.deb nightly/QzoneArchive-nightly_amd64.deb
+          cp artifacts/linux-x64/*.rpm nightly/QzoneArchive-nightly_x86_64.rpm
+          cp artifacts/linux-arm64/*.AppImage nightly/QzoneArchive-nightly_aarch64.AppImage
+          cp artifacts/linux-arm64/*.deb nightly/QzoneArchive-nightly_arm64.deb
           cp artifacts/android/*.apk nightly/QzoneArchive-nightly-universal.apk
           cp artifacts/ios-unsigned/*.ipa nightly/QzoneArchive-nightly-ios-arm64-unsigned.ipa
           cp artifacts/nixos/*.tar.gz nightly/qzonearchive-nixos-nightly-x86_64-linux.tar.gz
