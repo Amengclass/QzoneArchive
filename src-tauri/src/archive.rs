@@ -26,6 +26,18 @@ pub struct ArchiveProgress {
     skipped: u32,
     message: String,
     retry_at: Option<i64>,
+    batch_retry: Option<BatchRetryProgress>,
+}
+
+/// 批量重试异常跳过记录时的实时进度。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRetryProgress {
+    current: u32,
+    total: u32,
+    recovered: u32,
+    failed: u32,
+    recovered_records: u64,
 }
 
 impl Default for ArchiveProgress {
@@ -38,6 +50,7 @@ impl Default for ArchiveProgress {
             skipped: 0,
             message: "尚未开始归档".into(),
             retry_at: None,
+            batch_retry: None,
         }
     }
 }
@@ -45,6 +58,8 @@ impl Default for ArchiveProgress {
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
+    batch_retrying: AtomicBool,
+    batch_cancel: AtomicBool,
     image_downloads: tokio::sync::Semaphore,
 }
 
@@ -53,6 +68,8 @@ impl ArchiveState {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
+            batch_retrying: AtomicBool::new(false),
+            batch_cancel: AtomicBool::new(false),
             image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
@@ -1410,6 +1427,9 @@ pub async fn start_feed_archive(
     interval_ms: u64,
 ) -> Result<ArchiveProgress, String> {
     let interval_ms = interval_ms.clamp(2_000, 30_000);
+    if archive.batch_retrying.load(Ordering::Relaxed) {
+        return Err("正在批量重试异常位置，请等待完成或停止后再开始归档".into());
+    }
     {
         let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
         if progress.status == "running" {
@@ -1423,6 +1443,7 @@ pub async fn start_feed_archive(
             skipped: 0,
             message: "正在准备归档…".into(),
             retry_at: None,
+            batch_retry: None,
         };
     }
     archive.cancel.store(false, Ordering::Relaxed);
@@ -1545,7 +1566,32 @@ pub async fn start_feed_archive(
                     }
                 }
             } else {
-                qzone::fetch_feeds(&login, "1", None).await?
+                let mut first_page_result = None;
+                for first_attempt in 1..=3u32 {
+                    match qzone::fetch_feeds(&login, "1", None).await {
+                        Ok(page) => {
+                            first_page_result = Some(page);
+                            break;
+                        }
+                        Err(error) if qzone::feed_error_can_skip(&error) => {
+                            if first_attempt < 3 {
+                                set_progress(&archive, |progress| {
+                                    progress.message = format!(
+                                        "第一页请求失败（{error}），{first_attempt}/3 次重试中…"
+                                    );
+                                });
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    (first_attempt as u64) * 3,
+                                ))
+                                .await;
+                                continue;
+                            }
+                            return Err(format!("第一页获取空间动态失败（已重试3次）：{error}"));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                first_page_result.ok_or("第一页获取空间动态失败：未知错误")?
             };
             let fetched = page.feeds.len() as u64;
             let next = if page.has_more {
@@ -1724,6 +1770,22 @@ pub async fn list_archive_skips(
 }
 
 #[tauri::command]
+pub async fn clear_resolved_archive_skips(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+) -> Result<u64, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    let connection = open_database(&app)?;
+    let removed = connection
+        .execute(
+            "DELETE FROM archive_skips WHERE owner_uin=?1 AND resolved_at IS NOT NULL",
+            params![owner_uin],
+        )
+        .map_err(|error| format!("清理已恢复的异常跳过记录失败：{error}"))?;
+    Ok(removed as u64)
+}
+
+#[tauri::command]
 pub async fn retry_archive_skip(
     app: tauri::AppHandle,
     login: tauri::State<'_, QLoginState>,
@@ -1731,7 +1793,131 @@ pub async fn retry_archive_skip(
     id: i64,
 ) -> Result<ArchiveSkipRetryResult, String> {
     let owner_uin = login.qzone_auth().await?.uin;
-    let connection = open_database(&app)?;
+    retry_single_skip(&app, &login, &archive, &owner_uin, id).await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSkipBatchRetryResult {
+    total: u32,
+    recovered: u32,
+    failed: u32,
+    recovered_records: u64,
+}
+
+#[tauri::command]
+pub async fn retry_all_archive_skips(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    archive: tauri::State<'_, ArchiveState>,
+    interval_ms: u64,
+) -> Result<ArchiveSkipBatchRetryResult, String> {
+    let owner_uin = login.qzone_auth().await?.uin;
+    ensure_archive_idle(&archive)?;
+    if archive
+        .batch_retrying
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err("已有批量重试在进行中".into());
+    }
+    let pending_ids = {
+        let connection = open_database(&app)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id FROM archive_skips WHERE owner_uin=?1 AND resolved_at IS NULL
+                 ORDER BY skipped_at ASC",
+            )
+            .map_err(|error| format!("读取异常跳过列表失败：{error}"))?;
+        let rows = statement
+            .query_map(params![owner_uin], |row| row.get(0))
+            .map_err(|error| format!("查询异常跳过列表失败：{error}"))?;
+        rows.collect::<Result<Vec<i64>, _>>()
+            .map_err(|error| format!("解析异常跳过列表失败：{error}"))?
+    };
+    let total = pending_ids.len() as u32;
+    let mut result = ArchiveSkipBatchRetryResult {
+        total,
+        recovered: 0,
+        failed: 0,
+        recovered_records: 0,
+    };
+    archive.batch_cancel.store(false, Ordering::Relaxed);
+    for (index, id) in pending_ids.into_iter().enumerate() {
+        if archive.batch_cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        set_progress(&archive, |progress| {
+            progress.batch_retry = Some(BatchRetryProgress {
+                current: index as u32 + 1,
+                total,
+                recovered: result.recovered,
+                failed: result.failed,
+                recovered_records: result.recovered_records,
+            });
+        });
+        match retry_single_skip(&app, &login, &archive, &owner_uin, id).await {
+            Ok(outcome) => {
+                if outcome.success {
+                    result.recovered += 1;
+                    result.recovered_records += outcome.recovered_records;
+                } else {
+                    result.failed += 1;
+                }
+                set_progress(&archive, |progress| {
+                    progress.batch_retry = Some(BatchRetryProgress {
+                        current: index as u32 + 1,
+                        total,
+                        recovered: result.recovered,
+                        failed: result.failed,
+                        recovered_records: result.recovered_records,
+                    });
+                });
+            }
+            Err(error) => {
+                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中") {
+                    break;
+                }
+                result.failed += 1;
+                set_progress(&archive, |progress| {
+                    progress.batch_retry = Some(BatchRetryProgress {
+                        current: index as u32 + 1,
+                        total,
+                        recovered: result.recovered,
+                        failed: result.failed,
+                        recovered_records: result.recovered_records,
+                    });
+                });
+            }
+        }
+        // 与归档任务保持一致的节奏，避免批量重试触发频率保护；
+        // 分片睡眠让"停止重试"能在当前请求结束后立即生效
+        let mut remaining_delay = archive_page_delay_ms(interval_ms);
+        while remaining_delay > 0 {
+            if archive.batch_cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let slice = remaining_delay.min(200);
+            tokio::time::sleep(std::time::Duration::from_millis(slice)).await;
+            remaining_delay -= slice;
+        }
+    }
+    archive.batch_retrying.store(false, Ordering::Relaxed);
+    archive.batch_cancel.store(false, Ordering::Relaxed);
+    set_progress(&archive, |progress| {
+        progress.batch_retry = None;
+    });
+    Ok(result)
+}
+
+async fn retry_single_skip(
+    app: &tauri::AppHandle,
+    login: &tauri::State<'_, QLoginState>,
+    archive: &tauri::State<'_, ArchiveState>,
+    owner_uin: &str,
+    id: i64,
+) -> Result<ArchiveSkipRetryResult, String> {
+    let connection = open_database(app)?;
     let (cursor, resolved_at) = connection
         .query_row(
             "SELECT cursor,resolved_at FROM archive_skips WHERE id=?1 AND owner_uin=?2",
@@ -1749,15 +1935,15 @@ pub async fn retry_archive_skip(
             recovered_records: 0,
         });
     }
-    if let Some(retry_at) = reserve_archive_page(&app, &owner_uin)? {
+    if let Some(retry_at) = reserve_archive_page(app, owner_uin)? {
         return Err(format!("请求频率保护中，请在 {retry_at} 后重试"));
     }
     let attempted_at = now();
-    match qzone::fetch_feeds(&login, "2", Some(&cursor)).await {
+    match qzone::fetch_feeds(login, "2", Some(&cursor)).await {
         Ok(page) => {
             let recovered_records = page.feeds.len() as u64;
-            save_retried_page(&app, &owner_uin, &page.feeds)?;
-            let connection = open_database(&app)?;
+            save_retried_page(app, owner_uin, &page.feeds)?;
+            let connection = open_database(app)?;
             connection
                 .execute(
                     "UPDATE archive_skips SET retry_count=retry_count+1,last_retry_at=?2,
@@ -1765,8 +1951,8 @@ pub async fn retry_archive_skip(
                     params![id, attempted_at, recovered_records, owner_uin],
                 )
                 .map_err(|error| format!("更新异常重试结果失败：{error}"))?;
-            let remaining = unresolved_skip_count(&app, &owner_uin)?;
-            set_progress(&archive, |progress| progress.skipped = remaining);
+            let remaining = unresolved_skip_count(app, owner_uin)?;
+            set_progress(archive, |progress| progress.skipped = remaining);
             Ok(ArchiveSkipRetryResult {
                 success: true,
                 message: format!("重试成功，已恢复 {recovered_records} 条接口记录"),
@@ -1775,7 +1961,7 @@ pub async fn retry_archive_skip(
         }
         Err(error) => {
             let summary = concise_archive_error(&error);
-            let connection = open_database(&app)?;
+            let connection = open_database(app)?;
             connection
                 .execute(
                     "UPDATE archive_skips SET retry_count=retry_count+1,last_retry_at=?2,error=?3
@@ -1795,6 +1981,7 @@ pub async fn retry_archive_skip(
 #[tauri::command]
 pub fn cancel_feed_archive(state: tauri::State<'_, ArchiveState>) {
     state.cancel.store(true, Ordering::Relaxed);
+    state.batch_cancel.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
