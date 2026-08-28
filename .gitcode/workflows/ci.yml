@@ -1,17 +1,17 @@
-name: CI Build - Linux
+name: CI Build
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
 
 jobs:
-  build-linux:
-    runs-on: [ubuntu-latest, x64, large]
+  build:
+    name: Build Linux
+    runs-on: ubuntu-latest
     steps:
-      - uses: checkout
-      - name: Install Node.js
+      - name: Checkout
+        uses: checkout
+      - name: Setup Node.js
         uses: setup-node
         with:
           node-version: '22'
@@ -19,76 +19,11 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustc --version
-          cargo --version
-      - name: Install Linux build dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libgtk-3-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            libgstreamer-plugins-ugly1.0-dev \
-            libgstreamer1.0-plugins-base \
-            libgstreamer1.0-plugins-good \
-            libgstreamer1.0-plugins-bad \
-            libgstreamer1.0-plugins-ugly \
-            libgstreamer1.0-libav \
-            fonts-noto-cjk
-      - name: Install npm dependencies
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libgtk-3-dev fonts-noto-cjk
+      - name: Install dependencies
         run: cd repo_workspace && npm ci
-      - name: Build Tauri (AppImage + deb + rpm)
+      - name: Build
         run: cd repo_workspace && npx tauri build --bundles appimage,deb,rpm
-
-  release:
-    needs: [build-linux]
-    runs-on: [ubuntu-latest, x64, small]
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: checkout
-      - name: Install Node.js
-        uses: setup-node
-        with:
-          node-version: '22'
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            libgtk-3-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            libgstreamer-plugins-ugly1.0-dev \
-            libgstreamer1.0-plugins-base \
-            libgstreamer1.0-plugins-good \
-            libgstreamer1.0-plugins-bad \
-            libgstreamer1.0-plugins-ugly \
-            libgstreamer1.0-libav \
-            fonts-noto-cjk
-      - name: Install npm dependencies
-        run: cd repo_workspace && npm ci
-      - name: Build Tauri
-        run: cd repo_workspace && npx tauri build --bundles appimage,deb,rpm
-      - name: Create Release
-        run: |
-          cd repo_workspace
-          VERSION="${GITHUB_REF_NAME}"
-          echo "Creating release for ${VERSION}"
-          mkdir -p release
-          cp src-tauri/target/release/bundle/appimage/*.AppImage release/ || true
-          cp src-tauri/target/release/bundle/deb/*.deb release/ || true
-          cp src-tauri/target/release/bundle/rpm/*.rpm release/ || true
-          ls -lh release/
