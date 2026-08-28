@@ -87,7 +87,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            xdg-utils
       - run: npm ci
       - run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb,rpm
       - uses: actions/upload-artifact@v4
