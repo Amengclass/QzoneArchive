@@ -63,8 +63,9 @@ jobs:
       - run: npx tauri build --target ${{ matrix.target }} --bundles dmg
       - name: Rename artifacts with platform prefix
         run: |
-          for f in src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg; do
-            mv "$f" "macos_${{ matrix.arch }}_$(basename "$f")"
+          DMG_DIR="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          for f in "$DMG_DIR"/*.dmg; do
+            mv "$f" "$DMG_DIR/macos_${{ matrix.arch }}_$(basename "$f")"
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -196,8 +197,9 @@ jobs:
       - run: npx tauri ios build --target aarch64 --ci --no-sign
       - name: Rename artifact with platform prefix
         run: |
-          for f in src-tauri/gen/apple/**/*.ipa; do
-            mv "$f" "ios_arm64_$(basename "$f")"
+          IPA_DIR="src-tauri/gen/apple"
+          for f in "$IPA_DIR"/**/*.ipa; do
+            mv "$f" "$IPA_DIR/ios_arm64_$(basename "$f")"
           done
       - uses: actions/upload-artifact@v4
         with:
