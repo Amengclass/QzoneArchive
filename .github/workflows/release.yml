@@ -61,6 +61,14 @@ jobs:
       - name: Build Windows
         run: npx tauri build
 
+      - name: Rename artifacts with platform prefix
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/release/bundle/nsis"
+          Get-ChildItem "$dir/*.exe" | ForEach-Object {
+            Rename-Item $_.FullName "windows_x64_$($_.Name)"
+          }
+
       - name: Show Windows artifacts
         if: always()
         shell: pwsh
@@ -107,6 +115,12 @@ jobs:
       - name: Build macOS x64
         run: npx tauri build --target x86_64-apple-darwin
 
+      - name: Rename artifacts with platform prefix
+        run: |
+          for f in src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg; do
+            mv "$f" "macos_x64_$(basename "$f")"
+          done
+
       - name: Show macOS x64 artifacts
         if: always()
         shell: bash
@@ -148,6 +162,12 @@ jobs:
 
       - name: Build macOS ARM64
         run: npx tauri build --target aarch64-apple-darwin
+
+      - name: Rename artifacts with platform prefix
+        run: |
+          for f in src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg; do
+            mv "$f" "macos_arm64_$(basename "$f")"
+          done
 
       - name: Show macOS ARM64 artifacts
         if: always()
@@ -271,11 +291,16 @@ jobs:
             --print-certs \
             "$APK_SIGNED"
 
+      - name: Rename artifact with platform prefix
+        run: |
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
+          mv "$APK_DIR/app-universal-release.apk" "$APK_DIR/android_arm64_app-universal-release.apk"
+
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
           name: android
-          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/android_arm64_*.apk
           if-no-files-found: error
 
   # Linux
@@ -513,7 +538,7 @@ jobs:
           - sudo 权限（安装时输入密码）
           EOF
 
-          tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
+          tar -czf dist/nix/nixos_x64_qzonearchive-nixos-x86_64-linux.tar.gz \
             -C dist/nix \
             install.sh qzonearchive.closure store-path.txt README.md
           ls -lh dist/nix
@@ -748,7 +773,7 @@ jobs:
           REF_NAME="${GITHUB_REF_NAME:-manual}"
           SAFE_REF_NAME="${REF_NAME//\//-}"
 
-          OUTPUT_NAME="QzoneArchive-${SAFE_REF_NAME}-ios-arm64-unsigned.ipa"
+          OUTPUT_NAME="ios_arm64_QzoneArchive-${SAFE_REF_NAME}-ios-arm64-unsigned.ipa"
 
           cp "$IPA_PATH" "dist/ios/$OUTPUT_NAME"
 
