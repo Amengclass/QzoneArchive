@@ -280,6 +280,15 @@ jobs:
 
   # Linux
   linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: linux-x64
+          - target: aarch64-unknown-linux-gnu
+            artifact: linux-arm64
+            cross: true
     runs-on: ubuntu-latest
     if: ${{ ! inputs.skip_linux }}
 
@@ -295,12 +304,27 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Install Linux build dependencies
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install Linux build dependencies (x64)
+        if: ${{ ! matrix.cross }}
         shell: bash
         run: |
           set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
@@ -308,20 +332,33 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      - name: Install Linux build dependencies (ARM64)
+        if: matrix.cross
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update || sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev:arm64 \
+            libayatana-appindicator3-dev:arm64 \
+            librsvg2-dev:arm64 \
+            patchelf
+
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Build Linux bundles
-        run: npx tauri build --bundles appimage,deb,rpm
+        run: npx tauri build --target ${{ matrix.target }} --bundles appimage,deb,rpm
 
       - name: Upload Linux bundles
         uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: ${{ matrix.artifact }}
           path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/rpm/*.rpm
+            src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
   # NixOS binary package
@@ -808,11 +845,17 @@ jobs:
           name: android
           path: artifacts/android
 
-      - name: Download Linux artifact
+      - name: Download Linux x64 artifact
         uses: actions/download-artifact@v7
         with:
-          name: linux
-          path: artifacts/linux
+          name: linux-x64
+          path: artifacts/linux-x64
+
+      - name: Download Linux ARM64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
 
       - name: Download NixOS artifact
         uses: actions/download-artifact@v7
@@ -839,9 +882,12 @@ jobs:
             artifacts/macos-x64/**/*.dmg
             artifacts/macos-arm64/**/*.dmg
             artifacts/android/**/*.apk
-            artifacts/linux/**/*.AppImage
-            artifacts/linux/**/*.deb
-            artifacts/linux/**/*.rpm
+            artifacts/linux-x64/**/*.AppImage
+            artifacts/linux-x64/**/*.deb
+            artifacts/linux-x64/**/*.rpm
+            artifacts/linux-arm64/**/*.AppImage
+            artifacts/linux-arm64/**/*.deb
+            artifacts/linux-arm64/**/*.rpm
             artifacts/nixos/**/*.tar.gz
           draft: true
           generate_release_notes: true
