@@ -15,6 +15,9 @@ AI collaborators: please read AGENTS.md for project-specific instructions, archi
 [**详细使用教程**](https://www.bilibili.com/video/BV1p7MZ6xEfk) 
 [**网盘下载地址**](https://pan.quark.cn/s/69baf8c8aadc)
 
+> [!CAUTION]
+> **近期出现因使用非仓库来源软件而导致账号信息泄露的情况，请务必仔细甄别软件来源。除本仓库发布的内容外，任何其他来源的程序均不可信，请勿下载或使用。**
+
 <a href="https://www.star-history.com/?repos=Gaoshu705%2FQzoneArchive&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Gaoshu705/QzoneArchive&type=date&theme=dark&legend=top-left&sealed_token=VVJL1S9RMakv50gmYM8C74miiTpiN4O14StqOWLkzBbJNM_ksdUxftRGOvO_1_fnDnEscvd9qj6qqnS-9dOYZkIrJhVYFxgmxN_0xduxtjm1eICUxBdfIQ" />
